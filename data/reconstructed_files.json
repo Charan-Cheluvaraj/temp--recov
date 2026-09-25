@@ -1,0 +1,50 @@
+[
+  {
+    "id": "rec_001",
+    "cluster_id": "c_000",
+    "file_type": "pdf",
+    "fragment_ids": [
+      "f_00000",
+      "f_00001",
+      "f_00002"
+    ],
+    "gap_count": 2,
+    "gap_positions": [
+      36864,
+      49152
+    ],
+    "gap_bytes_total": 28672,
+    "reconstruction_confidence": 0.9,
+    "completeness": 0.3,
+    "structural_validity": "PASS",
+    "corruption_estimate": 0.7,
+    "integrity_score": 65.0,
+    "priority_score": 75.5,
+    "sensitivity_hits": [],
+    "sensitivity_hit_count": 0,
+    "ambiguous": false
+  },
+  {
+    "id": "rec_002",
+    "cluster_id": "c_001",
+    "file_type": "jpeg",
+    "fragment_ids": [
+      "f_00003",
+      "f_00004"
+    ],
+    "gap_count": 1,
+    "gap_positions": [
+      135168
+    ],
+    "gap_bytes_total": 4096,
+    "reconstruction_confidence": 0.9,
+    "completeness": 0.6667,
+    "structural_validity": "PASS",
+    "corruption_estimate": 0.3333,
+    "integrity_score": 83.33,
+    "priority_score": 68.33,
+    "sensitivity_hits": [],
+    "sensitivity_hit_count": 0,
+    "ambiguous": false
+  }
+]
