@@ -1,5 +1,5 @@
 """
-tests/test_prioritize.py - Verification tests for Layer 4 & Layer 5 Prioritization & Sensitivity Engine.
+tests/test_prioritize.py - Verification tests for Layer 4 & Layer 5 Prioritization, Sensitivity & YARA Engine.
 """
 
 import os
@@ -90,8 +90,21 @@ def test_high_sensitivity_artifacts_in_top_tier(ranked_data):
     assert len(top_file.sensitivity_hits) > 0
 
     # Ensure sensitive items (PII memo or salary document) have hits
-    sensitive_files = [f for f in results.files if any("AADHAAR" in h or "PAN" in h or "CREDIT" in h or "SALARY" in h for h in f.sensitivity_hits)]
+    sensitive_files = [f for f in results.files if any("AADHAAR" in h or "PAN" in h or "CREDIT" in h or "SALARY" in h or "CorporateCredentials" in h or "ConfidentialIncidentMemo" in h for h in f.sensitivity_hits)]
     assert len(sensitive_files) >= 1, "At least one file must contain recognized PII or financial hits"
+
+
+def test_yara_rule_matches_present(ranked_data):
+    """Verifies that compiled YARA rules match threat/credential patterns in reconstructed files."""
+    _, _, results = ranked_data
+
+    all_hits = {h for f in results.files for h in f.sensitivity_hits}
+    yara_rule_names = {"CorporateCredentials", "ConfidentialIncidentMemo", "PrivateKeyMarker"}
+    
+    matched_yara_rules = all_hits.intersection(yara_rule_names)
+    assert len(matched_yara_rules) > 0, (
+        f"Expected at least one YARA rule match in sensitivity_hits, found hits: {all_hits}"
+    )
 
 
 def test_decomposed_confidence_signals_and_bounds(ranked_data):

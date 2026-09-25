@@ -14,7 +14,7 @@
       49152
     ],
     "gap_bytes_total": 28672,
-    "reconstruction_confidence": 0.9,
+    "reconstruction_confidence": 0.95,
     "completeness": 0.3,
     "structural_validity": "PASS",
     "corruption_estimate": 0.7,
@@ -37,7 +37,7 @@
       135168
     ],
     "gap_bytes_total": 4096,
-    "reconstruction_confidence": 0.9,
+    "reconstruction_confidence": 0.95,
     "completeness": 0.6667,
     "structural_validity": "PASS",
     "corruption_estimate": 0.3333,

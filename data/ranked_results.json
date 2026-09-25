@@ -26,7 +26,7 @@
         "PHONE_NUMBER",
         "US_BANK_NUMBER",
         "US_DRIVER_LICENSE",
-        "CONFIDENTIAL_MEMO"
+        "ConfidentialIncidentMemo"
       ],
       "sensitivity_hit_count": 9,
       "ambiguous": false
@@ -46,12 +46,12 @@
         49152
       ],
       "gap_bytes_total": 28672,
-      "reconstruction_confidence": 0.9,
+      "reconstruction_confidence": 0.95,
       "completeness": 0.3,
       "structural_validity": "PASS",
       "corruption_estimate": 0.7,
-      "integrity_score": 66.0,
-      "priority_score": 84.51,
+      "integrity_score": 67.25,
+      "priority_score": 84.76,
       "sensitivity_hits": [
         "UK_NHS",
         "AADHAAR_NUMBER",
@@ -61,7 +61,7 @@
         "ORGANIZATION",
         "US_DRIVER_LICENSE",
         "US_BANK_NUMBER",
-        "SALARY_DISBURSEMENT"
+        "ConfidentialIncidentMemo"
       ],
       "sensitivity_hit_count": 9,
       "ambiguous": false
@@ -81,7 +81,7 @@
       "structural_validity": "PARTIAL",
       "corruption_estimate": 0.0,
       "integrity_score": 81.25,
-      "priority_score": 75.74,
+      "priority_score": 74.27,
       "sensitivity_hits": [
         "CREDIT_CARD",
         "AADHAAR_NUMBER",
@@ -89,10 +89,9 @@
         "PERSON",
         "US_BANK_NUMBER",
         "US_DRIVER_LICENSE",
-        "SECURITY_TOKEN",
-        "SYS_CREDENTIAL"
+        "CorporateCredentials"
       ],
-      "sensitivity_hit_count": 8,
+      "sensitivity_hit_count": 7,
       "ambiguous": false
     },
     {
@@ -108,12 +107,12 @@
         135168
       ],
       "gap_bytes_total": 4096,
-      "reconstruction_confidence": 0.9,
+      "reconstruction_confidence": 0.95,
       "completeness": 0.6667,
       "structural_validity": "PASS",
       "corruption_estimate": 0.3333,
-      "integrity_score": 82.5,
-      "priority_score": 72.42,
+      "integrity_score": 83.75,
+      "priority_score": 72.67,
       "sensitivity_hits": [
         "PERSON",
         "ORGANIZATION",

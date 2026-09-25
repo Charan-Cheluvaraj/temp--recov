@@ -1,5 +1,5 @@
 {
-  "summary": "Forensic triage analyzed evidence image (SHA-256: 644e103c5a9b79c0...). Successfully assembled 4 reconstructed artifacts across 2 clusters. Prioritized artifacts include rec_003, rec_001, rec_004, with critical exposure of AADHAAR_NUMBER, CONFIDENTIAL_MEMO, CREDIT_CARD, DATE_TIME, INDIAN_PAN.",
+  "summary": "Forensic triage analyzed evidence image (SHA-256: 644e103c5a9b79c0...). Successfully assembled 4 reconstructed artifacts across 2 clusters. Prioritized artifacts include rec_003, rec_001, rec_004, with critical exposure of AADHAAR_NUMBER, CREDIT_CARD, ConfidentialIncidentMemo, CorporateCredentials, DATE_TIME.",
   "cited_files": [
     "rec_003",
     "rec_001",
@@ -7,8 +7,8 @@
   ],
   "key_findings": [
     "Critical exposure in rec_003 (TEXT) with priority score 86.1 and 9 sensitivity hits including CREDIT_CARD, DATE_TIME, AADHAAR_NUMBER.",
-    "Recovered rec_001 (PDF) with PASS structural validity and integrity score 66.0% across 3 carved sectors.",
-    "Third priority artifact rec_004 (BINARY) verified with integrity score 81.2% and 8 security detection markers."
+    "Recovered rec_001 (PDF) with PASS structural validity and integrity score 67.2% across 3 carved sectors.",
+    "Third priority artifact rec_004 (BINARY) verified with integrity score 81.2% and 7 security detection markers."
   ],
   "partial_recoveries": [
     "rec_001 (PDF, 2 gaps, 28672 missing bytes)",

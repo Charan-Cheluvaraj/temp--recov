@@ -8,7 +8,7 @@ import pytest
 from typing import List
 
 from modules.schemas import Fragment, FragmentCluster, ReconstructedFile
-from modules.cluster_recon import run_reconstruction
+from modules.cluster_recon import run_reconstruction, run_magika_verification
 
 
 @pytest.fixture(scope="module")
@@ -111,6 +111,16 @@ def test_at_least_one_pdf_and_jpeg_pass_structural_validity(recon_data):
 
     assert len(pass_pdfs) >= 1, f"Must have at least 1 PDF passing structural validity, found {len(pass_pdfs)}"
     assert len(pass_jpegs) >= 1, f"Must have at least 1 JPEG passing structural validity, found {len(pass_jpegs)}"
+
+
+def test_magika_verification_execution():
+    """Verifies that Google Magika deep learning identification executes on sample payloads without error."""
+    test_pdf_payload = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\n%%EOF"
+    res = run_magika_verification("test_candidate", test_pdf_payload)
+    assert res is not None, "Magika must return identification output"
+    ct_label, score = res
+    assert ct_label == "pdf", f"Expected 'pdf' from Magika, got {ct_label}"
+    assert 0.0 <= score <= 1.0, f"Score {score} out of range"
 
 
 if __name__ == "__main__":

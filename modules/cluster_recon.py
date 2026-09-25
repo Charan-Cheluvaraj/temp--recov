@@ -3,7 +3,7 @@ modules/cluster_recon.py - Layer 3: Relationship Graph & Structural Reconstructi
 
 Performs:
 1. L3A: DBSCAN Cosine Feature Clustering & Cluster Formation.
-2. L3B: Format-Specific Structural Reconstruction (JPEG, PDF).
+2. L3B: Format-Specific Structural Reconstruction (JPEG, PDF) with Google Magika AI Secondary Verification.
 3. L3C: Text Permutation & Sentence-Boundary Scoring.
 4. Export to data/fragment_clusters.json and data/reconstructed_files.json.
 """
@@ -25,6 +25,14 @@ from pypdf import PdfReader
 from sklearn.cluster import DBSCAN
 
 from modules.schemas import Fragment, FeatureVector, FragmentCluster, ReconstructedFile
+
+
+# Magika Deep Learning File Identification Client (Lazy / Safe Initialization)
+try:
+    from magika import Magika
+    magika_client: Optional[Magika] = Magika()
+except Exception as e:
+    magika_client = None
 
 
 def load_data(
@@ -233,6 +241,24 @@ def reconstruct_text_cluster(ordered_frags: List[Fragment], evidence_bytes: byte
     return best_payload, validity
 
 
+def run_magika_verification(candidate_id: str, payload: bytes) -> Optional[Tuple[str, float]]:
+    """
+    Executes Google Magika deep learning file identification across reconstructed bytes.
+    Returns (ct_label, score) if successful.
+    """
+    if magika_client is None or not payload:
+        return None
+    try:
+        res = magika_client.identify_bytes(payload)
+        ct_label = res.output.label if hasattr(res.output, "label") else getattr(res.output, "ct_label", "unknown")
+        score = float(getattr(res, "score", 1.0))
+        print(f"[+] [Magika AI Verification] Candidate {candidate_id} verified as: {ct_label} (Score/Confidence: {score:.2f})")
+        return ct_label, score
+    except Exception as e:
+        print(f"[!] Magika verification note: {e}")
+        return None
+
+
 def reconstruct_cluster(
     cluster: FragmentCluster,
     frag_dict: Dict[str, Fragment],
@@ -240,8 +266,9 @@ def reconstruct_cluster(
     recon_idx: int
 ) -> ReconstructedFile:
     """
-    Reconstructs a single FragmentCluster into a ReconstructedFile model.
+    Reconstructs a single FragmentCluster into a ReconstructedFile model with Magika AI validation.
     """
+    recon_id = f"rec_{recon_idx:03d}"
     ordered_frags = sort_cluster_fragments(cluster, frag_dict)
     gap_count, gap_positions, gap_bytes_total = calculate_gap_metrics(ordered_frags)
 
@@ -264,6 +291,9 @@ def reconstruct_cluster(
     else:
         structural_validity = "PARTIAL" if len(concat_payload) > 0 else "FAIL"
 
+    # Google Magika AI Secondary File-Type Verification
+    magika_result = run_magika_verification(recon_id, concat_payload)
+
     # Decomposed Confidence Scoring
     completeness = min(1.0, total_frag_bytes / max(1, total_frag_bytes + gap_bytes_total))
     
@@ -274,6 +304,16 @@ def reconstruct_cluster(
     else:
         recon_conf = 0.2
 
+    # Integrity & Confidence adjustment from Magika AI match
+    if magika_result is not None:
+        ct_label, score = magika_result
+        if (
+            (file_type == "jpeg" and ct_label == "jpeg")
+            or (file_type == "pdf" and ct_label == "pdf")
+            or (file_type == "text" and ct_label in ("txt", "text", "python", "json", "code"))
+        ):
+            recon_conf = min(1.0, recon_conf + 0.05)
+
     corruption_estimate = gap_bytes_total / max(1, total_frag_bytes + gap_bytes_total)
 
     val_score = 1.0 if structural_validity == "PASS" else (0.5 if structural_validity == "PARTIAL" else 0.0)
@@ -283,8 +323,6 @@ def reconstruct_cluster(
     sensitivity_bonus = 30.0 if any(kw in preview_str for kw in ("CONFIDENTIAL", "PII", "Aadhaar", "PAN", "Credit Card")) else 10.0
     priority_score = min(100.0, round(integrity_score * 0.7 + sensitivity_bonus, 2))
 
-    recon_id = f"rec_{recon_idx:03d}"
-
     return ReconstructedFile(
         id=recon_id,
         cluster_id=cluster.cluster_id,
@@ -293,7 +331,7 @@ def reconstruct_cluster(
         gap_count=gap_count,
         gap_positions=gap_positions,
         gap_bytes_total=gap_bytes_total,
-        reconstruction_confidence=recon_conf,
+        reconstruction_confidence=round(recon_conf, 4),
         completeness=round(completeness, 4),
         structural_validity=structural_validity,
         corruption_estimate=round(corruption_estimate, 4),
@@ -318,7 +356,7 @@ def run_reconstruction(
     clusters, orphans = perform_dbscan_clustering(fragments, vectors)
     print(f"[+] Formed {len(clusters)} clusters ({len(orphans)} orphan fragments).")
 
-    # Step 2: L3B & L3C Reconstruction
+    # Step 2: L3B & L3C Reconstruction with Magika verification
     reconstructed_files: List[ReconstructedFile] = []
     for idx, cluster in enumerate(clusters):
         rf = reconstruct_cluster(cluster, frag_dict, evidence_bytes, recon_idx=idx+1)

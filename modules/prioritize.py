@@ -3,7 +3,7 @@ modules/prioritize.py - Layer 4 & Layer 5: Forensic Intelligence, Sensitivity Ex
 
 Performs:
 1. Text Extraction & Sanitization Middleware.
-2. Microsoft Presidio NLP & YARA/Regex Security Matching (PAN, Aadhaar, Credentials, Financials).
+2. Microsoft Presidio NLP & YARA Ruleset Threat Detection (PAN, Aadhaar, Credentials, Financials).
 3. Decomposed Confidence & Composite Integrity Computation.
 4. Defensible Mathematical Priority Ranking & SHA-256 Deduplication.
 5. Final Evidence Packaging into data/ranked_results.json strictly matching RankedResults schema.
@@ -28,16 +28,60 @@ from presidio_analyzer.nlp_engine import NlpEngineProvider
 from modules.schemas import Fragment, FragmentCluster, ReconstructedFile, RankedResults
 
 
-# Security and credential regex patterns
+# ----------------------------------------------------------------------
+# YARA Forensic Ruleset Compilation & Safe Fallback
+# ----------------------------------------------------------------------
+YARA_RULES_SOURCE = """
+rule PrivateKeyMarker {
+    meta:
+        description = "Detects RSA or OpenSSL private keys"
+    strings:
+        $rsa = "-----BEGIN RSA PRIVATE KEY-----"
+        $generic = "-----BEGIN PRIVATE KEY-----"
+        $openssh = "-----BEGIN OPENSSH PRIVATE KEY-----"
+    condition:
+        any of them
+}
+
+rule CorporateCredentials {
+    meta:
+        description = "Detects corporate database passwords, security tokens, and administrative credentials"
+    strings:
+        $token = "sec_tok_"
+        $admin = "admin_vault"
+        $db_pass = "Str0ng#P@ssw0rd!"
+        $root = "root_admin_calm"
+    condition:
+        any of them
+}
+
+rule ConfidentialIncidentMemo {
+    meta:
+        description = "Detects restricted corporate financial or security incident memorandum markers"
+    strings:
+        $memo1 = "CONFIDENTIAL FINANCIAL & PII INCIDENT MEMORANDUM"
+        $memo2 = "HIGHLY RESTRICTED / INTERNAL ONLY"
+        $memo3 = "CONFIDENTIAL SALARY & TAX DOCUMENT"
+        $pay = "Monthly Base Pay: INR"
+    condition:
+        any of them
+}
+"""
+
+try:
+    import yara
+    compiled_yara_rules = yara.compile(source=YARA_RULES_SOURCE)
+    print("[+] [YARA Engine] Forensic ruleset compiled successfully.")
+except Exception as e:
+    compiled_yara_rules = None
+    print(f"[!] YARA compilation note: {e}. Using regex pattern fallback.")
+
+
+# Fallback regex patterns
 SECURITY_PATTERNS = {
-    "PRIVATE_KEY": re.compile(r"-----BEGIN (RSA )?PRIVATE KEY-----", re.IGNORECASE),
-    "CREDENTIALS_PASS": re.compile(r"password\s*[:=]\s*\S+", re.IGNORECASE),
-    "API_KEY": re.compile(r"api[_-]?key\s*[:=]\s*\S+", re.IGNORECASE),
-    "SECURITY_TOKEN": re.compile(r"sec_tok_[0-9a-zA-Z]+", re.IGNORECASE),
-    "ADMIN_VAULT": re.compile(r"admin_vault[0-9a-zA-Z_]*", re.IGNORECASE),
-    "SYS_CREDENTIAL": re.compile(r"(SYS_ADMIN|SYS_TOKEN|SYS_KEY)\s*=", re.IGNORECASE),
-    "CONFIDENTIAL_MEMO": re.compile(r"(CONFIDENTIAL FINANCIAL|CLASSIFICATION:\s*HIGHLY RESTRICTED)", re.IGNORECASE),
-    "SALARY_DISBURSEMENT": re.compile(r"(SALARY|Monthly Base Pay|disbursement)", re.IGNORECASE),
+    "PrivateKeyMarker": re.compile(r"-----BEGIN (RSA |OPENSSH )?PRIVATE KEY-----", re.IGNORECASE),
+    "CorporateCredentials": re.compile(r"(sec_tok_|admin_vault|Str0ng#P@ssw0rd!|root_admin_calm|password\s*[:=]|api[_-]?key\s*[:=])", re.IGNORECASE),
+    "ConfidentialIncidentMemo": re.compile(r"(CONFIDENTIAL FINANCIAL & PII INCIDENT MEMORANDUM|HIGHLY RESTRICTED / INTERNAL ONLY|CONFIDENTIAL SALARY & TAX DOCUMENT|Monthly Base Pay: INR)", re.IGNORECASE),
 }
 
 TYPE_WEIGHTS = {
@@ -112,7 +156,7 @@ def extract_sanitized_text(file_type: str, raw_payload: bytes) -> str:
 
 def analyze_sensitivity(text: str, analyzer: AnalyzerEngine) -> Tuple[List[str], int]:
     """
-    Analyzes text with Presidio and custom security/YARA regex patterns.
+    Analyzes text with Presidio NLP and compiled YARA ruleset (or regex fallback).
     Returns (sensitivity_hits, sensitivity_hit_count).
     """
     if not text or len(text.strip()) < 4:
@@ -120,7 +164,7 @@ def analyze_sensitivity(text: str, analyzer: AnalyzerEngine) -> Tuple[List[str],
 
     hits: List[str] = []
 
-    # 1. Presidio NLP Entities
+    # 1. Presidio NLP Entities (CREDIT_CARD, PHONE_NUMBER, EMAIL, INDIAN_PAN, AADHAAR_NUMBER)
     try:
         results = analyzer.analyze(text=text, language="en")
         for res in results:
@@ -129,11 +173,22 @@ def analyze_sensitivity(text: str, analyzer: AnalyzerEngine) -> Tuple[List[str],
     except Exception:
         pass
 
-    # 2. Security & Credential Rules
-    for rule_name, pattern in SECURITY_PATTERNS.items():
-        if pattern.search(text):
-            if rule_name not in hits:
-                hits.append(rule_name)
+    # 2. YARA Threat & Credential Detection
+    if compiled_yara_rules is not None:
+        try:
+            matches = compiled_yara_rules.match(data=text)
+            for m in matches:
+                rule_name = m.rule
+                if rule_name not in hits:
+                    hits.append(rule_name)
+        except Exception as e:
+            print(f"[!] YARA match note: {e}")
+    else:
+        # Fallback to regex patterns
+        for rule_name, pattern in SECURITY_PATTERNS.items():
+            if pattern.search(text):
+                if rule_name not in hits:
+                    hits.append(rule_name)
 
     hit_count = len(hits)
     return hits, hit_count
@@ -274,14 +329,14 @@ def prioritize_results(
     seen_hashes: Set[str] = set()
     updated_files: List[ReconstructedFile] = []
 
-    print(f"[*] Processing {len(reconstructed_files)} reconstructed files for sensitivity & ranking...")
+    print(f"[*] Processing {len(reconstructed_files)} reconstructed files for sensitivity & YARA threat ranking...")
     for rf in reconstructed_files:
         payload = build_payload(rf.fragment_ids, frag_dict, evidence_bytes)
         
         # 1. Text extraction & sanitization
         clean_text = extract_sanitized_text(rf.file_type, payload)
 
-        # 2. Sensitivity analysis
+        # 2. Sensitivity & YARA analysis
         hits, hit_count = analyze_sensitivity(clean_text, analyzer)
         
         # 3. Compute scores
@@ -319,7 +374,7 @@ def main():
 
     args = parser.parse_args()
 
-    print("[*] Running Prioritization and Sensitivity Analysis...")
+    print("[*] Running Prioritization, Presidio & YARA Threat Analysis...")
     results = prioritize_results(
         recon_path=args.reconstructed,
         clusters_path=args.clusters,

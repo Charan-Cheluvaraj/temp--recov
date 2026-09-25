@@ -9,8 +9,8 @@
   "recall": 1.0,
   "f1_score": 1.0,
   "matched_artifacts": [
-    "Confidential_PII_Memo.txt",
     "Salary_Document.pdf",
+    "Confidential_PII_Memo.txt",
     "Employee_Photo.jpg"
   ]
 }
