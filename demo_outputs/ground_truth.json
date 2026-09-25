@@ -1,0 +1,49 @@
+{
+  "image_sha256": "644e103c5a9b79c06645612ab843a1126d79067d3b928ef94f43f969cadcfe27",
+  "total_size": 52428800,
+  "files": [
+    {
+      "filename": "Salary_Document.pdf",
+      "sha256": "878ebae001b2cd586a87cd4445af2443750bbd562014af560d1118254666fcea",
+      "size": 12288,
+      "is_deleted": true,
+      "expected_fragments": 3,
+      "sectors": [
+        64,
+        88,
+        136
+      ]
+    },
+    {
+      "filename": "Employee_Photo.jpg",
+      "sha256": "a03d990d7e4dcce8f2cf3364304a144dc683c1d2c1a06eaa8343dd765463588d",
+      "size": 8192,
+      "is_deleted": true,
+      "expected_fragments": 2,
+      "sectors": [
+        256,
+        272
+      ]
+    },
+    {
+      "filename": "Confidential_PII_Memo.txt",
+      "sha256": "4ab224e58e8ad35968cb4b01b573038f7a3d403d73bf151f7a28066bbf70d296",
+      "size": 4096,
+      "is_deleted": true,
+      "expected_fragments": 1,
+      "sectors": [
+        384
+      ]
+    },
+    {
+      "filename": "Corporate_Credentials.txt",
+      "sha256": "7a0de38c155b19a4a3ea8fe80aeaacb32f021aca48f346bea0ded1184e264a78",
+      "size": 2048,
+      "is_deleted": false,
+      "expected_fragments": 1,
+      "sectors": [
+        512
+      ]
+    }
+  ]
+}

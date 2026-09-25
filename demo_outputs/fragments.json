@@ -1,0 +1,86 @@
+[
+  {
+    "id": "f_00000",
+    "offset": 32768,
+    "length": 4096,
+    "type_hint": "pdf",
+    "entropy": 4.2454,
+    "source": "carve",
+    "pipeline_tag": "mixed",
+    "header_flag": true,
+    "footer_flag": false,
+    "raw_preview": "%PDF-1.4 % 1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj"
+  },
+  {
+    "id": "f_00001",
+    "offset": 45056,
+    "length": 4096,
+    "type_hint": "text",
+    "entropy": 3.5607,
+    "source": "carve",
+    "pipeline_tag": "mixed",
+    "header_flag": false,
+    "footer_flag": false,
+    "raw_preview": "ALARY_STREAM_CALMSTACKS_PDF_SALARY_STREAM_CALMSTACKS_PDF_SALARY_"
+  },
+  {
+    "id": "f_00002",
+    "offset": 69632,
+    "length": 4096,
+    "type_hint": "pdf",
+    "entropy": 3.7097,
+    "source": "carve",
+    "pipeline_tag": "mixed",
+    "header_flag": false,
+    "footer_flag": true,
+    "raw_preview": "TREAM_CALMSTACKS_PDF_SALARY_STREAM_CALMSTACKS_PDF_SALARY_STREAM_"
+  },
+  {
+    "id": "f_00003",
+    "offset": 131072,
+    "length": 4096,
+    "type_hint": "jpeg",
+    "entropy": 7.5604,
+    "source": "carve",
+    "pipeline_tag": "binary",
+    "header_flag": true,
+    "footer_flag": false,
+    "raw_preview": "FF D8 FF E0 00 10 4A 46 49 46 00 01 01 00 00 01"
+  },
+  {
+    "id": "f_00004",
+    "offset": 139264,
+    "length": 4096,
+    "type_hint": "jpeg",
+    "entropy": 3.6814,
+    "source": "carve",
+    "pipeline_tag": "mixed",
+    "header_flag": false,
+    "footer_flag": true,
+    "raw_preview": "4F 52 45 4E 53 49 43 5F 4A 50 45 47 5F 50 41 44"
+  },
+  {
+    "id": "f_00005",
+    "offset": 196608,
+    "length": 4096,
+    "type_hint": "text",
+    "entropy": 1.5862,
+    "source": "carve",
+    "pipeline_tag": "text",
+    "header_flag": false,
+    "footer_flag": false,
+    "raw_preview": "================================================================"
+  },
+  {
+    "id": "f_00006",
+    "offset": 262144,
+    "length": 4096,
+    "type_hint": "binary",
+    "entropy": 5.3757,
+    "source": "carve",
+    "pipeline_tag": "mixed",
+    "header_flag": false,
+    "footer_flag": false,
+    "raw_preview": "# CALMSTACKS CORPORATE CREDENTIAL VAULT SYS_ADMIN=root_admin_cal"
+  }
+]
