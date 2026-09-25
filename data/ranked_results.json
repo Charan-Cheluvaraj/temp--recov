@@ -1,0 +1,155 @@
+{
+  "evidence_image_hash": "644e103c5a9b79c06645612ab843a1126d79067d3b928ef94f43f969cadcfe27",
+  "files": [
+    {
+      "id": "rec_003",
+      "cluster_id": "c_unassigned",
+      "file_type": "text",
+      "fragment_ids": [
+        "f_00005"
+      ],
+      "gap_count": 0,
+      "gap_positions": [],
+      "gap_bytes_total": 0,
+      "reconstruction_confidence": 0.85,
+      "completeness": 1.0,
+      "structural_validity": "PASS",
+      "corruption_estimate": 0.0,
+      "integrity_score": 96.25,
+      "priority_score": 86.06,
+      "sensitivity_hits": [
+        "CREDIT_CARD",
+        "DATE_TIME",
+        "AADHAAR_NUMBER",
+        "INDIAN_PAN",
+        "ORGANIZATION",
+        "PHONE_NUMBER",
+        "US_BANK_NUMBER",
+        "US_DRIVER_LICENSE",
+        "CONFIDENTIAL_MEMO"
+      ],
+      "sensitivity_hit_count": 9,
+      "ambiguous": false
+    },
+    {
+      "id": "rec_001",
+      "cluster_id": "c_000",
+      "file_type": "pdf",
+      "fragment_ids": [
+        "f_00000",
+        "f_00001",
+        "f_00002"
+      ],
+      "gap_count": 2,
+      "gap_positions": [
+        36864,
+        49152
+      ],
+      "gap_bytes_total": 28672,
+      "reconstruction_confidence": 0.9,
+      "completeness": 0.3,
+      "structural_validity": "PASS",
+      "corruption_estimate": 0.7,
+      "integrity_score": 66.0,
+      "priority_score": 84.51,
+      "sensitivity_hits": [
+        "UK_NHS",
+        "AADHAAR_NUMBER",
+        "INDIAN_PAN",
+        "DATE_TIME",
+        "PERSON",
+        "ORGANIZATION",
+        "US_DRIVER_LICENSE",
+        "US_BANK_NUMBER",
+        "SALARY_DISBURSEMENT"
+      ],
+      "sensitivity_hit_count": 9,
+      "ambiguous": false
+    },
+    {
+      "id": "rec_004",
+      "cluster_id": "c_unassigned",
+      "file_type": "binary",
+      "fragment_ids": [
+        "f_00006"
+      ],
+      "gap_count": 0,
+      "gap_positions": [],
+      "gap_bytes_total": 0,
+      "reconstruction_confidence": 0.85,
+      "completeness": 1.0,
+      "structural_validity": "PARTIAL",
+      "corruption_estimate": 0.0,
+      "integrity_score": 81.25,
+      "priority_score": 75.74,
+      "sensitivity_hits": [
+        "CREDIT_CARD",
+        "AADHAAR_NUMBER",
+        "INDIAN_PAN",
+        "PERSON",
+        "US_BANK_NUMBER",
+        "US_DRIVER_LICENSE",
+        "SECURITY_TOKEN",
+        "SYS_CREDENTIAL"
+      ],
+      "sensitivity_hit_count": 8,
+      "ambiguous": false
+    },
+    {
+      "id": "rec_002",
+      "cluster_id": "c_001",
+      "file_type": "jpeg",
+      "fragment_ids": [
+        "f_00003",
+        "f_00004"
+      ],
+      "gap_count": 1,
+      "gap_positions": [
+        135168
+      ],
+      "gap_bytes_total": 4096,
+      "reconstruction_confidence": 0.9,
+      "completeness": 0.6667,
+      "structural_validity": "PASS",
+      "corruption_estimate": 0.3333,
+      "integrity_score": 82.5,
+      "priority_score": 72.42,
+      "sensitivity_hits": [
+        "PERSON",
+        "ORGANIZATION",
+        "DATE_TIME",
+        "NRP",
+        "US_DRIVER_LICENSE"
+      ],
+      "sensitivity_hit_count": 5,
+      "ambiguous": false
+    }
+  ],
+  "clusters": [
+    {
+      "cluster_id": "c_000",
+      "fragment_ids": [
+        "f_00000",
+        "f_00001",
+        "f_00002"
+      ],
+      "type": "pdf",
+      "confidence": 0.95,
+      "reason": "DBSCAN & header/footer matching for PDF"
+    },
+    {
+      "cluster_id": "c_001",
+      "fragment_ids": [
+        "f_00003",
+        "f_00004"
+      ],
+      "type": "jpeg",
+      "confidence": 0.95,
+      "reason": "DBSCAN & header/footer matching for JPEG"
+    }
+  ],
+  "orphans": [
+    "f_00005",
+    "f_00006"
+  ]
+}
