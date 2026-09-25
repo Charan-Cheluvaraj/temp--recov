@@ -107,3 +107,14 @@ class GroundTruthManifest(BaseModel):
     image_sha256: str = Field(..., description="SHA-256 hash of complete generated evidence.raw image")
     total_size: int = Field(..., description="Total size of evidence image in bytes")
     files: List[GroundTruthFile] = Field(default_factory=list, description="List of planted ground truth files")
+
+
+class ForensicReport(BaseModel):
+    """
+    Executive digital forensic triage report generated from structured evidence.
+    """
+    summary: str = Field(..., description="Executive summary of evidence triage")
+    cited_files: List[str] = Field(default_factory=list, description="List of cited reconstructed file IDs")
+    key_findings: List[str] = Field(..., min_length=3, max_length=3, description="Exactly 3 concise bullets detailing key findings")
+    partial_recoveries: List[str] = Field(default_factory=list, description="Observed fragmented or partially recovered files")
+    recommended_actions: List[str] = Field(..., min_length=3, max_length=3, description="Exactly 3 prioritized investigator actions")

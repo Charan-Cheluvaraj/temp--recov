@@ -1,0 +1,16 @@
+{
+  "ground_truth_total_files": 4,
+  "ground_truth_deleted_targets": 3,
+  "recovered_candidate_files": 4,
+  "true_positives": 3,
+  "false_positives": 0,
+  "false_negatives": 0,
+  "precision": 1.0,
+  "recall": 1.0,
+  "f1_score": 1.0,
+  "matched_artifacts": [
+    "Confidential_PII_Memo.txt",
+    "Salary_Document.pdf",
+    "Employee_Photo.jpg"
+  ]
+}
