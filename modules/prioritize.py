@@ -15,6 +15,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 import re
 import json
+import time
 import math
 import hashlib
 import argparse
@@ -71,10 +72,10 @@ rule ConfidentialIncidentMemo {
 try:
     import yara
     compiled_yara_rules = yara.compile(source=YARA_RULES_SOURCE)
-    print("[+] [YARA Engine] Forensic ruleset compiled successfully.")
+    print("[+] [YARA Engine] Forensic ruleset compiled successfully.", flush=True)
 except Exception as e:
     compiled_yara_rules = None
-    print(f"[!] YARA compilation note: {e}. Using regex pattern fallback.")
+    print(f"[!] YARA compilation note: {e}. Using regex pattern fallback.", flush=True)
 
 
 # Fallback regex patterns
@@ -157,6 +158,7 @@ def extract_sanitized_text(file_type: str, raw_payload: bytes) -> str:
 def analyze_sensitivity(text: str, analyzer: AnalyzerEngine) -> Tuple[List[str], int]:
     """
     Analyzes text with Presidio NLP and compiled YARA ruleset (or regex fallback).
+    Uses fast pattern pre-filtering to prevent expensive full NLP evaluation on inert text.
     Returns (sensitivity_hits, sensitivity_hit_count).
     """
     if not text or len(text.strip()) < 4:
@@ -164,14 +166,16 @@ def analyze_sensitivity(text: str, analyzer: AnalyzerEngine) -> Tuple[List[str],
 
     hits: List[str] = []
 
-    # 1. Presidio NLP Entities (CREDIT_CARD, PHONE_NUMBER, EMAIL, INDIAN_PAN, AADHAAR_NUMBER)
-    try:
-        results = analyzer.analyze(text=text, language="en")
-        for res in results:
-            if res.entity_type not in hits:
-                hits.append(res.entity_type)
-    except Exception:
-        pass
+    # Fast pre-check: only run Presidio if text contains potential PII markers (digits, @, tokens)
+    has_pii_potential = bool(re.search(r"(\d{4}|@|[A-Z]{5}\d{4}[A-Z]|credit|card|phone|pan|aadhaar|salary|tax)", text, re.IGNORECASE))
+    if has_pii_potential:
+        try:
+            results = analyzer.analyze(text=text, language="en")
+            for res in results:
+                if res.entity_type not in hits:
+                    hits.append(res.entity_type)
+        except Exception:
+            pass
 
     # 2. YARA Threat & Credential Detection
     if compiled_yara_rules is not None:
@@ -182,7 +186,7 @@ def analyze_sensitivity(text: str, analyzer: AnalyzerEngine) -> Tuple[List[str],
                 if rule_name not in hits:
                     hits.append(rule_name)
         except Exception as e:
-            print(f"[!] YARA match note: {e}")
+            pass
     else:
         # Fallback to regex patterns
         for rule_name, pattern in SECURITY_PATTERNS.items():
@@ -273,6 +277,9 @@ def prioritize_results(
     Main execution pipeline for Layer 4 & Layer 5.
     Analyzes sensitivity, computes decomposed scores, ranks files, and creates RankedResults.
     """
+    t_stage_start = time.perf_counter()
+    print("[START] Stage 5 — Sensitivity/Priority", flush=True)
+
     with open(recon_path, "r", encoding="utf-8") as f:
         reconstructed_files = [ReconstructedFile.model_validate(item) for item in json.load(f)]
 
@@ -293,12 +300,23 @@ def prioritize_results(
     existing_frag_sets = {tuple(sorted(rf.fragment_ids)) for rf in reconstructed_files}
     next_idx = len(reconstructed_files) + 1
 
+    # Keep candidate files for meaningful orphans (text or header-bearing)
     for orphan_id in orphan_frag_ids:
         orphan_frag = frag_dict[orphan_id]
         if (orphan_id,) not in existing_frag_sets:
-            # Create candidate file
             orphan_payload = evidence_bytes[orphan_frag.offset:orphan_frag.offset+orphan_frag.length]
             cand_type = orphan_frag.type_hint
+            
+            # Only include candidate files for meaningful orphans to avoid noise explosion
+            is_meaningful = (
+                orphan_frag.header_flag 
+                or orphan_frag.type_hint in ("text", "pdf", "jpeg") 
+                or orphan_frag.pipeline_tag == "text"
+                or (orphan_frag.entropy > 1.0 and len(orphan_payload) > 0)
+            )
+            if not is_meaningful:
+                continue
+
             struct_val = "PASS" if orphan_frag.type_hint == "text" and len(orphan_payload) > 0 else "PARTIAL"
             
             rf_cand = ReconstructedFile(
@@ -320,16 +338,21 @@ def prioritize_results(
                 ambiguous=False
             )
             reconstructed_files.append(rf_cand)
+            existing_frag_sets.add((orphan_id,))
             next_idx += 1
 
     # Initialize Presidio NLP Analyzer
-    print("[*] Initializing Presidio Analyzer Engine...")
+    t0_pres = time.perf_counter()
+    print("[*] Initializing Presidio Analyzer Engine...", flush=True)
     analyzer = build_analyzer_engine()
+    t_pres_init = time.perf_counter() - t0_pres
+    print(f"[+] Presidio Analyzer initialized in {t_pres_init:.3f}s", flush=True)
 
     seen_hashes: Set[str] = set()
     updated_files: List[ReconstructedFile] = []
 
-    print(f"[*] Processing {len(reconstructed_files)} reconstructed files for sensitivity & YARA threat ranking...")
+    print(f"[*] Processing {len(reconstructed_files)} candidate artifacts for sensitivity & YARA threat ranking...", flush=True)
+    t0_sens = time.perf_counter()
     for rf in reconstructed_files:
         payload = build_payload(rf.fragment_ids, frag_dict, evidence_bytes)
         
@@ -349,6 +372,9 @@ def prioritize_results(
 
         updated_files.append(rf)
 
+    t_sens_elapsed = time.perf_counter() - t0_sens
+    print(f"[*] Sensitivity analysis completed in {t_sens_elapsed:.3f}s for {len(reconstructed_files)} artifacts", flush=True)
+
     # Sort strictly descending by priority_score
     updated_files.sort(key=lambda x: x.priority_score, reverse=True)
 
@@ -361,6 +387,8 @@ def prioritize_results(
         orphans=orphan_frag_ids
     )
 
+    t_stage_end = time.perf_counter()
+    print(f"[END]   Stage 5 — Sensitivity/Priority | elapsed={t_stage_end - t_stage_start:.2f}s", flush=True)
     return ranked_results
 
 
@@ -374,7 +402,7 @@ def main():
 
     args = parser.parse_args()
 
-    print("[*] Running Prioritization, Presidio & YARA Threat Analysis...")
+    print("[*] Running Prioritization, Presidio & YARA Threat Analysis...", flush=True)
     results = prioritize_results(
         recon_path=args.reconstructed,
         clusters_path=args.clusters,
@@ -386,17 +414,19 @@ def main():
     with open(args.output, "w", encoding="utf-8") as f:
         f.write(results.model_dump_json(indent=2))
 
-    print(f"[+] Output successfully written to: {args.output}")
-    print(f"[+] Evidence Image SHA-256: {results.evidence_image_hash}")
+    print(f"[+] Output successfully written to: {args.output}", flush=True)
+    print(f"[+] Evidence Image SHA-256: {results.evidence_image_hash}", flush=True)
     
-    print("\n==========================================================================================")
-    print("                              PRIORITIZED EVIDENCE RANKING                                 ")
-    print("==========================================================================================")
-    for rank, rf in enumerate(results.files, 1):
+    print("\n==========================================================================================", flush=True)
+    print("                              PRIORITIZED EVIDENCE RANKING                                 ", flush=True)
+    print("==========================================================================================", flush=True)
+    for rank, rf in enumerate(results.files[:20], 1):
         hits_str = ", ".join(rf.sensitivity_hits[:3]) if rf.sensitivity_hits else "None"
-        print(f" #{rank:02d} | ID: {rf.id:7s} | Type: {rf.file_type:6s} | Priority: {rf.priority_score:6.2f} | Integrity: {rf.integrity_score:6.2f} | Hits ({rf.sensitivity_hit_count}): {hits_str}")
-    print("==========================================================================================\n")
-    print("[OK] Layer 4 & Layer 5 Prioritization complete.")
+        print(f" #{rank:02d} | ID: {rf.id:7s} | Type: {rf.file_type:6s} | Priority: {rf.priority_score:6.2f} | Integrity: {rf.integrity_score:6.2f} | Hits ({rf.sensitivity_hit_count}): {hits_str}", flush=True)
+    if len(results.files) > 20:
+        print(f" ... and {len(results.files) - 20} more ranked artifacts.", flush=True)
+    print("==========================================================================================\n", flush=True)
+    print("[OK] Layer 4 & Layer 5 Prioritization complete.", flush=True)
 
 
 if __name__ == "__main__":

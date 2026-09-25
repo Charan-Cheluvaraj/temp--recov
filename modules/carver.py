@@ -10,6 +10,7 @@ import os
 import sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 import json
+import time
 import argparse
 import numpy as np
 from typing import List, Optional, Tuple, Dict
@@ -153,6 +154,9 @@ def carve_image(
     """
     Carves the raw forensic image into Pydantic-validated Fragment instances.
     """
+    t_start = time.perf_counter()
+    print("[START] Stage 1 — Carving", flush=True)
+
     if not os.path.exists(image_path):
         raise FileNotFoundError(f"Evidence file not found: {image_path}")
 
@@ -213,6 +217,8 @@ def carve_image(
             )
             fragments.append(frag)
 
+    t_end = time.perf_counter()
+    print(f"[END]   Stage 1 — Carving | elapsed={t_end - t_start:.2f}s ({len(fragments)} fragments kept)", flush=True)
     return fragments
 
 
@@ -224,18 +230,18 @@ def main():
     
     args = parser.parse_args()
 
-    print(f"[*] Reading evidence image from: {args.input}")
-    print(f"[*] Block / Cluster size: {args.chunk_size} bytes")
+    print(f"[*] Reading evidence image from: {args.input}", flush=True)
+    print(f"[*] Block / Cluster size: {args.chunk_size} bytes", flush=True)
     
     if not os.path.exists(args.input):
-        print(f"[!] Error: {args.input} does not exist. Run modules/generate_data.py first.")
+        print(f"[!] Error: {args.input} does not exist. Run modules/generate_data.py first.", flush=True)
         sys.exit(1)
 
     file_size = os.path.getsize(args.input)
     total_sectors = file_size // 512
     total_chunks = (file_size + args.chunk_size - 1) // args.chunk_size
-    print(f"[+] Evidence size: {file_size} bytes ({file_size / (1024*1024):.1f} MB)")
-    print(f"[+] Total 512-byte sectors: {total_sectors} | Total chunks: {total_chunks}")
+    print(f"[+] Evidence size: {file_size} bytes ({file_size / (1024*1024):.1f} MB)", flush=True)
+    print(f"[+] Total 512-byte sectors: {total_sectors} | Total chunks: {total_chunks}", flush=True)
 
     fragments = carve_image(args.input, chunk_size=args.chunk_size)
     
@@ -244,7 +250,7 @@ def main():
     with open(args.output, "w", encoding="utf-8") as f:
         json.dump([frag.model_dump() for frag in fragments], f, indent=2)
 
-    print(f"[+] Saved {len(fragments)} carved fragments to: {args.output}")
+    print(f"[+] Saved {len(fragments)} carved fragments to: {args.output}", flush=True)
 
     # Summary Statistics
     type_counts = Counter(f.type_hint for f in fragments)
@@ -253,18 +259,21 @@ def main():
     binary_count = tag_counts.get("binary", 0)
     mixed_count = tag_counts.get("mixed", 0)
 
-    print("\n==================================================")
-    print("           CARVING SUMMARY STATISTICS             ")
-    print("==================================================")
-    print(f"Total Chunks Scanned    : {total_chunks}")
-    print(f"Carved Fragments Kept   : {len(fragments)}")
-    print(f"Type Distribution       : {dict(type_counts)}")
-    print(f"Pipeline Tags           : Binary={binary_count}, Mixed={mixed_count}, Text={text_count}")
-    print("==================================================")
-    for frag in fragments:
-        print(f" [{frag.id}] Offset: {frag.offset:8d} (0x{frag.offset:06X}) | Type: {frag.type_hint:7s} | Tag: {frag.pipeline_tag:6s} | Entropy: {frag.entropy:.2f} | H:{int(frag.header_flag)} F:{int(frag.footer_flag)} | Preview: {frag.raw_preview[:40]}")
-    print("==================================================\n")
-    print("[OK] Layer 1 Carving complete.")
+    print("\n==================================================", flush=True)
+    print("           CARVING SUMMARY STATISTICS             ", flush=True)
+    print("==================================================", flush=True)
+    print(f"Total Chunks Scanned    : {total_chunks}", flush=True)
+    print(f"Carved Fragments Kept   : {len(fragments)}", flush=True)
+    print(f"Type Distribution       : {dict(type_counts)}", flush=True)
+    print(f"Pipeline Tags           : Binary={binary_count}, Mixed={mixed_count}, Text={text_count}", flush=True)
+    print("==================================================", flush=True)
+    preview_limit = min(20, len(fragments))
+    for frag in fragments[:preview_limit]:
+        print(f" [{frag.id}] Offset: {frag.offset:8d} (0x{frag.offset:06X}) | Type: {frag.type_hint:7s} | Tag: {frag.pipeline_tag:6s} | Entropy: {frag.entropy:.2f} | H:{int(frag.header_flag)} F:{int(frag.footer_flag)} | Preview: {frag.raw_preview[:40]}", flush=True)
+    if len(fragments) > preview_limit:
+        print(f" ... and {len(fragments) - preview_limit} more fragments.", flush=True)
+    print("==================================================\n", flush=True)
+    print("[OK] Layer 1 Carving complete.", flush=True)
 
 
 if __name__ == "__main__":

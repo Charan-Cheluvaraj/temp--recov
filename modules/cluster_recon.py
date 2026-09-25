@@ -2,7 +2,7 @@
 modules/cluster_recon.py - Layer 3: Relationship Graph & Structural Reconstruction Engine for CALMSTACKS.
 
 Performs:
-1. L3A: DBSCAN Cosine Feature Clustering & Cluster Formation.
+1. L3A: DBSCAN Cosine Feature Clustering & Cluster Formation (n_jobs=-1).
 2. L3B: Format-Specific Structural Reconstruction (JPEG, PDF) with Google Magika AI Secondary Verification.
 3. L3C: Text Permutation & Sentence-Boundary Scoring.
 4. Export to data/fragment_clusters.json and data/reconstructed_files.json.
@@ -14,6 +14,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 import re
 import json
+import time
 import argparse
 import itertools
 import numpy as np
@@ -63,16 +64,19 @@ def perform_dbscan_clustering(
     L3A: Performs DBSCAN cosine clustering on feature vectors and forms FragmentCluster models.
     Returns (clusters, orphan_fragment_ids).
     """
+    t_start = time.perf_counter()
     frag_dict = {f.id: f for f in fragments}
     vec_map = {v.fragment_id: v.vec for v in vectors}
 
     # Prepare vector matrix in fragment order
-    X = np.array([vec_map[f.id] for f in fragments if f.id in vec_map], dtype=np.float64)
+    X = np.array([vec_map[f.id] for f in fragments if f.id in vec_map], dtype=np.float32)
     
     if len(X) == 0:
         return [], [f.id for f in fragments]
 
-    db = DBSCAN(eps=eps, min_samples=min_samples, metric="cosine").fit(X)
+    print(f"[*] DBSCAN input shape: {X.shape} (metric='cosine', eps={eps}, min_samples={min_samples})", flush=True)
+
+    db = DBSCAN(eps=eps, min_samples=min_samples, metric="cosine", n_jobs=-1).fit(X)
     labels = db.labels_
 
     clusters_map: Dict[int, List[str]] = defaultdict(list)
@@ -138,6 +142,8 @@ def perform_dbscan_clustering(
         result_clusters.append(cluster_obj)
 
     final_orphans = sorted(list(merged_orphans))
+    t_elapsed = time.perf_counter() - t_start
+    print(f"[*] DBSCAN completed in {t_elapsed:.3f}s: {len(result_clusters)} clusters formed, {len(final_orphans)} orphan fragments.", flush=True)
     return result_clusters, final_orphans
 
 
@@ -216,6 +222,7 @@ def score_text_permutation(text: str) -> float:
 def reconstruct_text_cluster(ordered_frags: List[Fragment], evidence_bytes: bytes) -> Tuple[bytes, str]:
     """
     L3C: Reconstructs text cluster payload by sentence-boundary scoring across permutations.
+    Strictly caps permutations to <= 5 fragments to avoid CPU combinatorial explosions.
     """
     payloads = [evidence_bytes[f.offset:f.offset+f.length] for f in ordered_frags]
     
@@ -223,17 +230,21 @@ def reconstruct_text_cluster(ordered_frags: List[Fragment], evidence_bytes: byte
         combined = b"".join(payloads)
         return combined, "PASS" if len(combined) > 0 else "FAIL"
 
-    # Test permutations if count <= 5
-    best_score = -1.0
-    best_payload = b"".join(payloads)
+    # Only test permutations if count <= 5
+    if len(payloads) <= 5:
+        best_score = -1.0
+        best_payload = b"".join(payloads)
 
-    for perm in itertools.permutations(payloads):
-        candidate = b"".join(perm)
-        decoded = candidate.decode("utf-8", errors="ignore")
-        score = score_text_permutation(decoded)
-        if score > best_score:
-            best_score = score
-            best_payload = candidate
+        for perm in itertools.permutations(payloads):
+            candidate = b"".join(perm)
+            decoded = candidate.decode("utf-8", errors="ignore")
+            score = score_text_permutation(decoded)
+            if score > best_score:
+                best_score = score
+                best_payload = candidate
+    else:
+        # For larger clusters, use the offset-ordered sequence
+        best_payload = b"".join(payloads)
 
     printable_ratio = sum(1 for b in best_payload if 32 <= b <= 126 or b in (9, 10, 13)) / max(1, len(best_payload))
     validity = "PASS" if printable_ratio > 0.85 else ("PARTIAL" if printable_ratio > 0.5 else "FAIL")
@@ -248,14 +259,16 @@ def run_magika_verification(candidate_id: str, payload: bytes) -> Optional[Tuple
     """
     if magika_client is None or not payload:
         return None
+    t0_magika = time.perf_counter()
     try:
         res = magika_client.identify_bytes(payload)
         ct_label = res.output.label if hasattr(res.output, "label") else getattr(res.output, "ct_label", "unknown")
         score = float(getattr(res, "score", 1.0))
-        print(f"[+] [Magika AI Verification] Candidate {candidate_id} verified as: {ct_label} (Score/Confidence: {score:.2f})")
+        t_magika_elapsed = time.perf_counter() - t0_magika
+        print(f"[*] [Magika AI] {candidate_id} verified as: {ct_label} (Score: {score:.2f}, elapsed: {t_magika_elapsed:.3f}s)", flush=True)
         return ct_label, score
     except Exception as e:
-        print(f"[!] Magika verification note: {e}")
+        print(f"[!] Magika verification note: {e}", flush=True)
         return None
 
 
@@ -268,7 +281,11 @@ def reconstruct_cluster(
     """
     Reconstructs a single FragmentCluster into a ReconstructedFile model with Magika AI validation.
     """
+    t_recon_start = time.perf_counter()
     recon_id = f"rec_{recon_idx:03d}"
+    print(f"[RECON] Cluster {cluster.cluster_id} START", flush=True)
+    print(f"[RECON] Cluster {cluster.cluster_id} type={cluster.type} fragments={len(cluster.fragment_ids)}", flush=True)
+
     ordered_frags = sort_cluster_fragments(cluster, frag_dict)
     gap_count, gap_positions, gap_bytes_total = calculate_gap_metrics(ordered_frags)
 
@@ -291,8 +308,12 @@ def reconstruct_cluster(
     else:
         structural_validity = "PARTIAL" if len(concat_payload) > 0 else "FAIL"
 
+    print(f"[RECON] Structural validation={structural_validity}", flush=True)
+
     # Google Magika AI Secondary File-Type Verification
     magika_result = run_magika_verification(recon_id, concat_payload)
+    magika_str = f"{magika_result[0]} (conf={magika_result[1]:.2f})" if magika_result else "unavailable"
+    print(f"[RECON] Magika={magika_str}", flush=True)
 
     # Decomposed Confidence Scoring
     completeness = min(1.0, total_frag_bytes / max(1, total_frag_bytes + gap_bytes_total))
@@ -323,6 +344,9 @@ def reconstruct_cluster(
     sensitivity_bonus = 30.0 if any(kw in preview_str for kw in ("CONFIDENTIAL", "PII", "Aadhaar", "PAN", "Credit Card")) else 10.0
     priority_score = min(100.0, round(integrity_score * 0.7 + sensitivity_bonus, 2))
 
+    t_recon_elapsed = time.perf_counter() - t_recon_start
+    print(f"[RECON] Cluster {cluster.cluster_id} END elapsed={t_recon_elapsed:.2f}s", flush=True)
+
     return ReconstructedFile(
         id=recon_id,
         cluster_id=cluster.cluster_id,
@@ -349,18 +373,30 @@ def run_reconstruction(
     evidence_path: str
 ) -> Tuple[List[FragmentCluster], List[ReconstructedFile]]:
     """Runs full Layer 3 clustering and reconstruction pipeline."""
+    t_stage3_start = time.perf_counter()
+    print("[START] Stage 3 — Relationships", flush=True)
+
     fragments, vectors, evidence_bytes = load_data(fragments_path, vectors_path, evidence_path)
     frag_dict = {f.id: f for f in fragments}
 
     # Step 1: L3A DBSCAN Clustering
     clusters, orphans = perform_dbscan_clustering(fragments, vectors)
-    print(f"[+] Formed {len(clusters)} clusters ({len(orphans)} orphan fragments).")
+    print(f"[+] Formed {len(clusters)} clusters ({len(orphans)} orphan fragments).", flush=True)
+
+    t_stage3_end = time.perf_counter()
+    print(f"[END]   Stage 3 — Relationships | elapsed={t_stage3_end - t_stage3_start:.2f}s", flush=True)
 
     # Step 2: L3B & L3C Reconstruction with Magika verification
+    t_stage4_start = time.perf_counter()
+    print("[START] Stage 4 — Reconstruction", flush=True)
+
     reconstructed_files: List[ReconstructedFile] = []
     for idx, cluster in enumerate(clusters):
         rf = reconstruct_cluster(cluster, frag_dict, evidence_bytes, recon_idx=idx+1)
         reconstructed_files.append(rf)
+
+    t_stage4_end = time.perf_counter()
+    print(f"[END]   Stage 4 — Reconstruction | elapsed={t_stage4_end - t_stage4_start:.2f}s", flush=True)
 
     return clusters, reconstructed_files
 
@@ -375,7 +411,7 @@ def main():
 
     args = parser.parse_args()
 
-    print(f"[*] Layer 3 Reconstruction starting...")
+    print(f"[*] Layer 3 Reconstruction starting...", flush=True)
     clusters, recon_files = run_reconstruction(args.fragments, args.vectors, args.evidence)
 
     os.makedirs(os.path.dirname(args.out_clusters) or ".", exist_ok=True)
@@ -386,16 +422,16 @@ def main():
     with open(args.out_files, "w", encoding="utf-8") as f:
         json.dump([rf.model_dump() for rf in recon_files], f, indent=2)
 
-    print(f"[+] Saved {len(clusters)} fragment clusters to: {args.out_clusters}")
-    print(f"[+] Saved {len(recon_files)} reconstructed files to: {args.out_files}")
+    print(f"[+] Saved {len(clusters)} fragment clusters to: {args.out_clusters}", flush=True)
+    print(f"[+] Saved {len(recon_files)} reconstructed files to: {args.out_files}", flush=True)
     
-    print("\n==================================================")
-    print("        RECONSTRUCTION SUMMARY STATISTICS          ")
-    print("==================================================")
+    print("\n==================================================", flush=True)
+    print("        RECONSTRUCTION SUMMARY STATISTICS          ", flush=True)
+    print("==================================================", flush=True)
     for rf in recon_files:
-        print(f" [{rf.id}] Cluster: {rf.cluster_id} | Type: {rf.file_type:6s} | Frags: {len(rf.fragment_ids)} | Validity: {rf.structural_validity:7s} | Integrity: {rf.integrity_score:6.2f} | Priority: {rf.priority_score:6.2f}")
-    print("==================================================\n")
-    print("[OK] Layer 3 Reconstruction complete.")
+        print(f" [{rf.id}] Cluster: {rf.cluster_id} | Type: {rf.file_type:6s} | Frags: {len(rf.fragment_ids)} | Validity: {rf.structural_validity:7s} | Integrity: {rf.integrity_score:6.2f} | Priority: {rf.priority_score:6.2f}", flush=True)
+    print("==================================================\n", flush=True)
+    print("[OK] Layer 3 Reconstruction complete.", flush=True)
 
 
 if __name__ == "__main__":

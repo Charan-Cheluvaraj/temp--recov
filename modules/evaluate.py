@@ -10,6 +10,7 @@ import sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 import json
+import time
 import argparse
 from typing import Dict, Any, List
 
@@ -24,6 +25,9 @@ def evaluate_reconstruction(
     Evaluates reconstructed files against ground truth manifest.
     Strictly isolated: does not leak ground truth into the recovery engine.
     """
+    t_stage_start = time.perf_counter()
+    print("[START] Stage 7 — Evaluation", flush=True)
+
     if not os.path.exists(ranked_results_path):
         raise FileNotFoundError(f"Ranked results not found: {ranked_results_path}")
     if not os.path.exists(ground_truth_path):
@@ -95,6 +99,8 @@ def evaluate_reconstruction(
         "matched_artifacts": list(matched_gt),
     }
 
+    t_stage_end = time.perf_counter()
+    print(f"[END]   Stage 7 — Evaluation | elapsed={t_stage_end - t_stage_start:.2f}s", flush=True)
     return metrics
 
 
@@ -105,27 +111,27 @@ def main():
     parser.add_argument("--output", default="data/evaluation_metrics.json", help="Path to output evaluation JSON")
     args = parser.parse_args()
 
-    print("[*] Running Isolated Ground-Truth Benchmark Evaluation...")
+    print("[*] Running Isolated Ground-Truth Benchmark Evaluation...", flush=True)
     metrics = evaluate_reconstruction(args.ranked, args.ground_truth)
 
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
     with open(args.output, "w", encoding="utf-8") as f:
         json.dump(metrics, f, indent=2)
 
-    print(f"[+] Evaluation metrics saved to: {args.output}\n")
-    print("==========================================================================================")
-    print("                      AUTODFBENCH BENCHMARK EVALUATION TABLE                              ")
-    print("==========================================================================================")
-    print(f" Target Deleted Files    : {metrics['ground_truth_deleted_targets']}")
-    print(f" Successfully Recovered  : {metrics['true_positives']} (TP)")
-    print(f" False Detections        : {metrics['false_positives']} (FP)")
-    print(f" Missed Targets          : {metrics['false_negatives']} (FN)")
-    print("------------------------------------------------------------------------------------------")
-    print(f" Precision               : {metrics['precision'] * 100:.2f}%")
-    print(f" Recall                  : {metrics['recall'] * 100:.2f}%")
-    print(f" F1-Score                : {metrics['f1_score'] * 100:.2f}%")
-    print("==========================================================================================\n")
-    print("[OK] Layer 6 Benchmark Evaluation complete.")
+    print(f"[+] Evaluation metrics saved to: {args.output}\n", flush=True)
+    print("==========================================================================================", flush=True)
+    print("                      AUTODFBENCH BENCHMARK EVALUATION TABLE                              ", flush=True)
+    print("==========================================================================================", flush=True)
+    print(f" Target Deleted Files    : {metrics['ground_truth_deleted_targets']}", flush=True)
+    print(f" Successfully Recovered  : {metrics['true_positives']} (TP)", flush=True)
+    print(f" False Detections        : {metrics['false_positives']} (FP)", flush=True)
+    print(f" Missed Targets          : {metrics['false_negatives']} (FN)", flush=True)
+    print("------------------------------------------------------------------------------------------", flush=True)
+    print(f" Precision               : {metrics['precision'] * 100:.2f}%", flush=True)
+    print(f" Recall                  : {metrics['recall'] * 100:.2f}%", flush=True)
+    print(f" F1-Score                : {metrics['f1_score'] * 100:.2f}%", flush=True)
+    print("==========================================================================================\n", flush=True)
+    print("[OK] Layer 6 Benchmark Evaluation complete.", flush=True)
 
 
 if __name__ == "__main__":

@@ -92,7 +92,7 @@ def init_session():
         "analysis_timestamp": None,
         "artifacts": None, "artifacts_error": None,
         "selected_file_id": None, "selected_cluster_id": None,
-        "pipeline_log": [], "case_id": None,
+        "pipeline_log": [], "case_id": None, "analysis_running": False,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -165,29 +165,42 @@ def ensure_evidence_hash():
         st.session_state["evidence_size"] = os.path.getsize(path)
         st.session_state["evidence_filename"] = os.path.basename(path)
 
-def execute_pipeline(evidence_path, output_dir=DATA_DIR):
+def execute_pipeline(evidence_path, output_dir=DATA_DIR, progress_callback=None):
+    import time
     import modules.carver as carver_mod
     import modules.fingerprint as fp_mod
     import modules.cluster_recon as cr_mod
     import modules.prioritize as pr_mod
     import modules.narrative as nar_mod
     import modules.evaluate as eval_mod
+
     os.makedirs(output_dir, exist_ok=True)
     log = []
     st.session_state["pipeline_log"] = log
 
-    def step(name, fn):
-        log.append({"stage": name, "status": "RUNNING"})
+    def step(name, pct_start, pct_end, fn):
+        t0 = time.perf_counter()
+        log.append({"stage": name, "status": "RUNNING", "elapsed": 0.0})
         st.session_state["pipeline_log"] = log[:]
+        if progress_callback:
+            progress_callback(name, "RUNNING", pct_start, 0.0)
         try:
             result = fn()
+            el = time.perf_counter() - t0
             log[-1]["status"] = "COMPLETE"
+            log[-1]["elapsed"] = round(el, 2)
             st.session_state["pipeline_log"] = log[:]
+            if progress_callback:
+                progress_callback(name, "COMPLETE", pct_end, el)
             return result
         except Exception as e:
+            el = time.perf_counter() - t0
             log[-1]["status"] = "ERROR"
             log[-1]["error"] = str(e)
+            log[-1]["elapsed"] = round(el, 2)
             st.session_state["pipeline_log"] = log[:]
+            if progress_callback:
+                progress_callback(name, "ERROR", pct_end, el)
             raise
 
     try:
@@ -196,13 +209,14 @@ def execute_pipeline(evidence_path, output_dir=DATA_DIR):
             with open(os.path.join(output_dir, "fragments.json"), "w", encoding="utf-8") as f:
                 json.dump([x.model_dump() for x in frags], f, indent=2)
             return frags
-        step("Stage 1 — Carving", do_carve)
+        step("Stage 1 — Carving", 10, 25, do_carve)
 
         def do_fp():
             fvs = fp_mod.generate_feature_vectors(os.path.join(output_dir, "fragments.json"), evidence_path)
             with open(os.path.join(output_dir, "feature_vectors.json"), "w", encoding="utf-8") as f:
                 json.dump([v.model_dump() for v in fvs], f, indent=2)
-        step("Stage 2 — Fingerprinting", do_fp)
+            return fvs
+        step("Stage 2 — Fingerprinting", 25, 50, do_fp)
 
         def do_recon():
             clusters, recon_files = cr_mod.run_reconstruction(
@@ -212,7 +226,8 @@ def execute_pipeline(evidence_path, output_dir=DATA_DIR):
                 json.dump([c.model_dump() for c in clusters], f, indent=2)
             with open(os.path.join(output_dir, "reconstructed_files.json"), "w", encoding="utf-8") as f:
                 json.dump([r.model_dump() for r in recon_files], f, indent=2)
-        step("Stage 3 — Relationships & Reconstruction", do_recon)
+            return clusters, recon_files
+        step("Stage 3 — Relationships & Reconstruction", 50, 75, do_recon)
 
         def do_prio():
             ranked = pr_mod.prioritize_results(
@@ -221,13 +236,15 @@ def execute_pipeline(evidence_path, output_dir=DATA_DIR):
                 os.path.join(output_dir, "fragments.json"), evidence_path)
             with open(os.path.join(output_dir, "ranked_results.json"), "w", encoding="utf-8") as f:
                 f.write(ranked.model_dump_json(indent=2))
-        step("Stage 4+5 — Sensitivity & Priority", do_prio)
+            return ranked
+        step("Stage 4+5 — Sensitivity & Priority", 75, 88, do_prio)
 
         def do_nar():
             report = nar_mod.generate_forensic_report(os.path.join(output_dir, "ranked_results.json"))
             with open(os.path.join(output_dir, "forensic_report.json"), "w", encoding="utf-8") as f:
                 f.write(report.model_dump_json(indent=2))
-        step("Stage 6 — Narrative Report", do_nar)
+            return report
+        step("Stage 6 — Narrative Report", 88, 95, do_nar)
 
         def do_eval():
             gt_path = os.path.join(output_dir, "ground_truth.json")
@@ -235,7 +252,8 @@ def execute_pipeline(evidence_path, output_dir=DATA_DIR):
                 em = eval_mod.evaluate_reconstruction(os.path.join(output_dir, "ranked_results.json"), gt_path)
                 with open(os.path.join(output_dir, "evaluation_metrics.json"), "w", encoding="utf-8") as f:
                     json.dump(em, f, indent=2)
-        step("Stage 7 — Benchmark Evaluation", do_eval)
+                return em
+        step("Stage 7 — Benchmark Evaluation", 95, 100, do_eval)
 
         st.session_state["analysis_status"] = "COMPLETE"
         st.session_state["analysis_mode"] = "LIVE"
@@ -508,34 +526,65 @@ def view_workspace():
 
 
 def view_evidence_intake():
+    import time
     render_page_header("EVIDENCE INTAKE", "Select a forensic evidence image or generate synthetic demo data.")
     tab_a, tab_b = st.tabs(["A — Analyze Existing Evidence", "B — Generate Demo Evidence"])
 
     with tab_a:
         st.markdown("""<div style='background:rgba(88,166,255,0.07);border:1px solid rgba(88,166,255,0.2);
              border-radius:6px;padding:10px 14px;margin-bottom:14px;font-size:0.78rem;color:#8b949e;'>
-            Upload a raw disk image. The file will be used read-only as evidence source.
+            Upload or select a forensic disk image (.dd, .raw, .img). Analysis is strictly read-only.
         </div>""", unsafe_allow_html=True)
 
-        uploaded = st.file_uploader("Upload Evidence Image", type=["dd","raw","img","bin","e01"])
-        local_path = st.text_input("Or enter local file path",
+        # Auto-detect staged evidence files in repository
+        staged_candidates = []
+        for sdir in ["cases/evidence_staging", "cases", "data"]:
+            if os.path.exists(sdir):
+                for fname in sorted(os.listdir(sdir)):
+                    if fname.endswith((".dd", ".raw", ".img", ".bin")):
+                        fpath = os.path.join(sdir, fname).replace("\\", "/")
+                        staged_candidates.append(fpath)
+
+        if staged_candidates:
+            st.markdown("<div class='cs-section-label' style='margin-top:0;'>Quick Select Detected Evidence</div>", unsafe_allow_html=True)
+            sc_cols = st.columns(min(3, len(staged_candidates)))
+            for i, cand in enumerate(staged_candidates[:3]):
+                c_name = os.path.basename(cand)
+                c_sz = fmt_bytes(os.path.getsize(cand)) if os.path.exists(cand) else ""
+                with sc_cols[i % len(sc_cols)]:
+                    is_cur = st.session_state.get("evidence_path") == cand
+                    btn_type = "primary" if is_cur else "secondary"
+                    if st.button(f"📄 {c_name} ({c_sz})", key=f"quick_ev_{i}", use_container_width=True, type=btn_type):
+                        st.session_state.update({
+                            "evidence_path": cand, "evidence_hash": None,
+                            "evidence_size": None, "evidence_filename": None,
+                            "case_id": f"CASE-2026-{c_name[:4].upper()}"
+                        })
+                        ensure_evidence_hash()
+                        st.rerun()
+
+        uploaded = st.file_uploader("Or Upload New Evidence File", type=["dd","raw","img","bin","e01"])
+        local_path = st.text_input("Or Specify Custom Path",
             value=st.session_state.get("evidence_path") or "",
-            placeholder="e.g. data/evidence.raw or C:/Cases/disk.dd")
+            placeholder="e.g. cases/evidence_staging/L1_Documents.dd or data/evidence.raw")
 
         if uploaded:
             os.makedirs("cases/evidence_staging", exist_ok=True)
-            dest = os.path.join("cases", "evidence_staging", uploaded.name)
+            dest = os.path.join("cases", "evidence_staging", uploaded.name).replace("\\", "/")
             with open(dest, "wb") as f: f.write(uploaded.read())
             st.session_state.update({"evidence_path": dest, "evidence_hash": None,
                                      "evidence_size": None, "evidence_filename": None,
                                      "case_id": f"CASE-{datetime.date.today().strftime('%Y%m%d')}-{uploaded.name[:4].upper()}"})
+            ensure_evidence_hash()
             st.success(f"Evidence staged: {dest}")
+            st.rerun()
         elif local_path and local_path != st.session_state.get("evidence_path"):
             if os.path.exists(local_path):
-                if st.button("Use This File"):
+                if st.button("Load This Evidence Path"):
                     st.session_state.update({"evidence_path": local_path, "evidence_hash": None,
                                              "evidence_size": None, "evidence_filename": None,
                                              "case_id": f"CASE-{datetime.date.today().strftime('%Y%m%d')}-EVD"})
+                    ensure_evidence_hash()
                     st.rerun()
             elif local_path:
                 st.warning("File not found at that path.")
@@ -550,28 +599,50 @@ def view_evidence_intake():
             p1,p2,p3 = st.columns(3)
             with p1: render_kpi_card("Filename", ev_name)
             with p2: render_kpi_card("Size", fmt_bytes(ev_size))
-            with p3: render_kpi_card("Status", "READY")
+            with p3: render_kpi_card("Integrity", "READY")
             st.markdown(f"<div class='hash-block'>SHA-256: {ev_hash}</div>", unsafe_allow_html=True)
             st.markdown("<hr class='cs-divider'>", unsafe_allow_html=True)
 
+            is_running = st.session_state.get("analysis_running", False)
             c_run, c_cache = st.columns(2)
             with c_run:
-                if st.button("▶ Analyze Evidence", type="primary", use_container_width=True):
+                if st.button("▶ Analyze Evidence", type="primary", use_container_width=True, disabled=is_running):
+                    st.session_state["analysis_running"] = True
                     st.session_state["analysis_status"] = "RUNNING"
                     st.session_state["artifacts"] = None
                     st.session_state["pipeline_log"] = []
-                    with st.spinner("Running forensic pipeline..."):
-                        success, err = execute_pipeline(ev_path, DATA_DIR)
-                    if success:
-                        arts, art_err = load_artifacts(DATA_DIR)
-                        st.session_state["artifacts"] = arts
-                        st.session_state["artifacts_error"] = art_err
-                        st.success("Pipeline complete.")
-                    else:
-                        render_error_card("Pipeline", str(err))
+
+                    live_container = st.container()
+                    with live_container:
+                        st.markdown("<div class='cs-section-label'>Live Pipeline Progress</div>", unsafe_allow_html=True)
+                        prog_bar = st.progress(0)
+                        status_box = st.empty()
+                        detail_box = st.empty()
+                        t_overall_start = time.perf_counter()
+
+                        def on_progress(stage_name, status, percent, elapsed_stage):
+                            t_tot = time.perf_counter() - t_overall_start
+                            prog_bar.progress(min(100, int(percent)))
+                            icon = "●" if status == "RUNNING" else ("✓" if status == "COMPLETE" else "✗")
+                            col = "#d29922" if status == "RUNNING" else ("#3fb950" if status == "COMPLETE" else "#f85149")
+                            status_box.markdown(f"<div style='font-size:0.88rem;color:{col};font-weight:600;'>{icon} {stage_name} ({status})</div>", unsafe_allow_html=True)
+                            detail_box.markdown(f"<div style='font-size:0.75rem;color:#8b949e;'>Stage time: <code>{elapsed_stage:.2f}s</code> | Overall elapsed: <code>{t_tot:.2f}s</code></div>", unsafe_allow_html=True)
+
+                        try:
+                            success, err = execute_pipeline(ev_path, DATA_DIR, progress_callback=on_progress)
+                            if success:
+                                arts, art_err = load_artifacts(DATA_DIR)
+                                st.session_state["artifacts"] = arts
+                                st.session_state["artifacts_error"] = art_err
+                                st.success("Pipeline complete.")
+                            else:
+                                render_error_card("Pipeline", str(err))
+                        finally:
+                            st.session_state["analysis_running"] = False
                     st.rerun()
+
             with c_cache:
-                if st.button("📂 Load Precomputed Cache", use_container_width=True):
+                if st.button("📂 Load Precomputed Cache", use_container_width=True, disabled=is_running):
                     arts, err = load_artifacts(DATA_DIR)
                     if arts:
                         st.session_state.update({"artifacts": arts, "artifacts_error": None,
