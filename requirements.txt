@@ -1,0 +1,17 @@
+pydantic>=2.0
+numpy
+scikit-learn
+pillow
+pypdf
+python-docx
+plotly
+streamlit
+presidio-analyzer
+presidio-anonymizer
+yara-python
+instructor
+anthropic
+sentence-transformers
+magika
+faiss-cpu
+spacy
