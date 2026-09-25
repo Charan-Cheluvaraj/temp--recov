@@ -44,7 +44,7 @@ def generate_luhn_credit_card() -> str:
 def create_synthetic_pdf(total_size: int = 12288) -> bytes:
     """
     Creates a valid synthetic PDF document containing text, Aadhaar, PAN, and corporate info.
-    Guarantees %PDF-1.4 header and %%EOF footer.
+    Guarantees %PDF-1.4 header and %%EOF footer with exact target length.
     """
     header = b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n"
     content_str = (
@@ -61,45 +61,45 @@ def create_synthetic_pdf(total_size: int = 12288) -> bytes:
         "ET\nendstream\nendobj\n"
     )
     
-    # Fill body with structural PDF comment padding to reach target size
     body = content_str.encode("utf-8")
     footer = b"\nxref\n0 5\n0000000000 65535 f \ntrailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n450\n%%EOF\n"
     
-    padding_len = total_size - len(header) - len(body) - len(footer)
-    if padding_len > 0:
-        padding = b"% PADDING: " + (b"X" * (padding_len - 12)) + b"\n"
+    pad_needed = total_size - len(header) - len(body) - len(footer)
+    if pad_needed > 0:
+        prefix = b"% PADDING_STREAM_DATA: "
+        suffix = b"\n"
+        fill_len = max(0, pad_needed - len(prefix) - len(suffix))
+        padding = prefix + (b"CALMSTACKS_PDF_SALARY_STREAM_" * 500)[:fill_len] + suffix
     else:
         padding = b""
         
     pdf_bytes = header + body + padding + footer
-    return pdf_bytes[:total_size].ljust(total_size, b"\x00")
+    return pdf_bytes[:total_size]
 
 
 def create_synthetic_jpeg(total_size: int = 8192) -> bytes:
     """
-    Creates a valid synthetic JPEG image with Pillow.
-    Ensures FF D8 FF header and FF D9 footer.
+    Creates a valid synthetic JPEG image with Pillow and pads with valid JPEG comment segment.
+    Ensures FF D8 FF header and FF D9 footer with exact total_size bytes.
     """
-    img = Image.new("RGB", (300, 300), color=(30, 60, 90))
+    img = Image.new("RGB", (150, 150), color=(30, 60, 90))
     draw = ImageDraw.Draw(img)
-    draw.rectangle([20, 20, 280, 280], outline=(255, 215, 0), width=4)
-    draw.text((40, 140), "EMPLOYEE PHOTO", fill=(255, 255, 255))
-    draw.text((40, 170), "ID: EMP-88392", fill=(200, 200, 200))
+    draw.rectangle([10, 10, 140, 140], outline=(255, 215, 0), width=2)
+    draw.text((20, 60), "EMPLOYEE PHOTO", fill=(255, 255, 255))
+    draw.text((20, 80), "ID: EMP-88392", fill=(200, 200, 200))
     
     buf = BytesIO()
-    img.save(buf, format="JPEG", quality=90)
+    img.save(buf, format="JPEG", quality=75)
     raw_jpg = buf.getvalue()
     
     if len(raw_jpg) < total_size:
-        # Pad with JPEG comment marker (FF FE len_hi len_lo ...) before FF D9
         pad_needed = total_size - len(raw_jpg)
-        if pad_needed > 4 and raw_jpg.endswith(b"\xff\xd9"):
-            comment_payload = b"PADDING" * (pad_needed // 7)
-            comment_payload = comment_payload[:pad_needed - 4]
-            comment_marker = b"\xff\xfe" + len(comment_payload + b"  ").to_bytes(2, "big") + comment_payload
-            raw_jpg = raw_jpg[:-2] + comment_marker + b"\xff\xd9"
+        payload_len = pad_needed - 4
+        payload = (b"FORENSIC_JPEG_PADDING_RECORD_" * 500)[:payload_len]
+        comment_segment = b"\xff\xfe" + (payload_len + 2).to_bytes(2, "big") + payload
+        raw_jpg = raw_jpg[:-2] + comment_segment + b"\xff\xd9"
             
-    return raw_jpg.ljust(total_size, b"\x00")
+    return raw_jpg[:total_size]
 
 
 def create_synthetic_pii_memo() -> bytes:
@@ -159,7 +159,6 @@ def generate_synthetic_disk_image() -> Tuple[bytes, GroundTruthManifest]:
     print(f"[+] Initializing synthetic disk image allocation ({IMAGE_SIZE / (1024*1024):.1f} MB)...")
     
     # Fill image background with deterministic low-entropy pseudo-random noise / filler
-    # Using repeating deterministic byte sequence
     noise_pattern = bytes([ (i * 37 + 13) % 256 for i in range(65536) ])
     raw_image = bytearray()
     for _ in range(IMAGE_SIZE // len(noise_pattern)):
@@ -301,6 +300,7 @@ def main():
     manifest_path = os.path.join("data", "ground_truth.json")
     with open(manifest_path, "w", encoding="utf-8") as f:
         f.write(manifest.model_dump_json(indent=2))
+    print(f"[+] Written ground truth manifest to: {manifest_path}")
     print("[OK] Data generation completed successfully.")
 
 

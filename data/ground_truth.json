@@ -1,10 +1,10 @@
 {
-  "image_sha256": "e48ce67921f7de89a16018468c8b275b8ad1fab6cf81ce48505402c36a7a6d2c",
+  "image_sha256": "644e103c5a9b79c06645612ab843a1126d79067d3b928ef94f43f969cadcfe27",
   "total_size": 52428800,
   "files": [
     {
       "filename": "Salary_Document.pdf",
-      "sha256": "83eba4f53b2c2b9ecf922a77c6fd45762f5566ae547a4e4ae8a59222dc28ee73",
+      "sha256": "878ebae001b2cd586a87cd4445af2443750bbd562014af560d1118254666fcea",
       "size": 12288,
       "is_deleted": true,
       "expected_fragments": 3,
@@ -16,8 +16,8 @@
     },
     {
       "filename": "Employee_Photo.jpg",
-      "sha256": "df113b170e7f9ecdd780d99198e876f3d86723f363df4a43de50248e239b0833",
-      "size": 8833,
+      "sha256": "a03d990d7e4dcce8f2cf3364304a144dc683c1d2c1a06eaa8343dd765463588d",
+      "size": 8192,
       "is_deleted": true,
       "expected_fragments": 2,
       "sectors": [
