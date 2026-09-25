@@ -8,6 +8,7 @@ import sys
 sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 
 import json
+import time
 import hashlib
 import math
 import datetime
@@ -25,7 +26,7 @@ from modules.schemas import (
 
 st.set_page_config(
     page_title="CALMSTACKS | Digital Forensics Platform",
-    page_icon="\U0001f52c",
+    page_icon="🔬",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -93,6 +94,10 @@ def init_session():
         "artifacts": None, "artifacts_error": None,
         "selected_file_id": None, "selected_cluster_id": None,
         "pipeline_log": [], "case_id": None, "analysis_running": False,
+        "analysis_stage": None, "analysis_percent": 0,
+        "analysis_stage_elapsed": 0.0, "analysis_total_elapsed": 0.0,
+        "analysis_error": None, "analysis_started_at": None,
+        "analysis_finished_at": None, "active_output_dir": None,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -130,7 +135,9 @@ def status_badge_html(status):
     kind = mapping.get(str(status).upper(), "info")
     return badge(str(status).upper(), kind)
 
-def load_artifacts(data_dir=DATA_DIR):
+def load_artifacts(data_dir=None):
+    if not data_dir:
+        data_dir = st.session_state.get("active_output_dir") or DATA_DIR
     paths = {
         "ranked": os.path.join(data_dir, "ranked_results.json"),
         "clusters": os.path.join(data_dir, "fragment_clusters.json"),
@@ -142,19 +149,30 @@ def load_artifacts(data_dir=DATA_DIR):
         "reconstructed": os.path.join(data_dir, "reconstructed_files.json"),
     }
     missing = [k for k, p in paths.items() if not os.path.exists(p)]
-    if missing:
-        return None, f"Missing: {', '.join(missing)}"
+    # Note: ground_truth is optional for arbitrary evidence images
+    core_missing = [k for k in missing if k != "ground_truth"]
+    if core_missing:
+        return None, f"Missing artifacts in {data_dir}: {', '.join(core_missing)}"
     try:
         with open(paths["ranked"], "r", encoding="utf-8") as f: results = RankedResults.model_validate(json.load(f))
         with open(paths["clusters"], "r", encoding="utf-8") as f: clusters = [FragmentCluster.model_validate(c) for c in json.load(f)]
         with open(paths["fragments"], "r", encoding="utf-8") as f: fragments = [Fragment.model_validate(x) for x in json.load(f)]
         with open(paths["report"], "r", encoding="utf-8") as f: report = ForensicReport.model_validate(json.load(f))
-        with open(paths["metrics"], "r", encoding="utf-8") as f: metrics = json.load(f)
-        with open(paths["ground_truth"], "r", encoding="utf-8") as f: gt = GroundTruthManifest.model_validate(json.load(f))
+        
+        metrics = None
+        if os.path.exists(paths["metrics"]):
+            with open(paths["metrics"], "r", encoding="utf-8") as f: metrics = json.load(f)
+        
+        gt = None
+        if os.path.exists(paths["ground_truth"]):
+            with open(paths["ground_truth"], "r", encoding="utf-8") as f: gt = GroundTruthManifest.model_validate(json.load(f))
+            
         with open(paths["feature_vectors"], "r", encoding="utf-8") as f: raw_fv = json.load(f)
         with open(paths["reconstructed"], "r", encoding="utf-8") as f: raw_recon = json.load(f)
-        return {"results": results, "clusters": clusters, "fragments": fragments, "report": report,
-                "metrics": metrics, "ground_truth": gt, "feature_vectors": raw_fv, "reconstructed": raw_recon}, None
+        return {
+            "results": results, "clusters": clusters, "fragments": fragments, "report": report,
+            "metrics": metrics or {}, "ground_truth": gt, "feature_vectors": raw_fv, "reconstructed": raw_recon
+        }, None
     except Exception as e:
         return None, f"Load error: {e}\n{traceback.format_exc()}"
 
@@ -165,7 +183,7 @@ def ensure_evidence_hash():
         st.session_state["evidence_size"] = os.path.getsize(path)
         st.session_state["evidence_filename"] = os.path.basename(path)
 
-def execute_pipeline(evidence_path, output_dir=DATA_DIR, progress_callback=None):
+def execute_pipeline(evidence_path, output_dir=None, progress_callback=None):
     import time
     import modules.carver as carver_mod
     import modules.fingerprint as fp_mod
@@ -174,6 +192,8 @@ def execute_pipeline(evidence_path, output_dir=DATA_DIR, progress_callback=None)
     import modules.narrative as nar_mod
     import modules.evaluate as eval_mod
 
+    if not output_dir:
+        output_dir = st.session_state.get("active_output_dir") or DATA_DIR
     os.makedirs(output_dir, exist_ok=True)
     log = []
     st.session_state["pipeline_log"] = log
@@ -248,12 +268,22 @@ def execute_pipeline(evidence_path, output_dir=DATA_DIR, progress_callback=None)
 
         def do_eval():
             gt_path = os.path.join(output_dir, "ground_truth.json")
+            if not os.path.exists(gt_path) and os.path.exists("data/ground_truth.json"):
+                gt_path = "data/ground_truth.json"
             if os.path.exists(gt_path):
                 em = eval_mod.evaluate_reconstruction(os.path.join(output_dir, "ranked_results.json"), gt_path)
                 with open(os.path.join(output_dir, "evaluation_metrics.json"), "w", encoding="utf-8") as f:
                     json.dump(em, f, indent=2)
                 return em
         step("Stage 7 — Benchmark Evaluation", 95, 100, do_eval)
+
+        # Integrity verification
+        with open(os.path.join(output_dir, "ranked_results.json"), "r", encoding="utf-8") as f:
+            res_dict = json.load(f)
+        expected_hash = sha256_file(evidence_path)
+        actual_hash = res_dict.get("evidence_image_hash")
+        if actual_hash != expected_hash:
+            raise ValueError(f"Evidence hash mismatch! Input: {expected_hash}, Result: {actual_hash}")
 
         st.session_state["analysis_status"] = "COMPLETE"
         st.session_state["analysis_mode"] = "LIVE"
@@ -332,8 +362,8 @@ def render_case_bar():
     ev_hash = st.session_state.get("evidence_hash")
     case_id = st.session_state.get("case_id") or "CASE-PENDING"
     short_hash = (ev_hash[:16] + "...") if ev_hash else "NOT COMPUTED"
-    status_label = "ANALYZED" if (mode == "LIVE" and status == "COMPLETE") else \
-                   "CACHED" if mode == "CACHED" else status
+    status_label = "ANALYZED (LIVE)" if (mode == "LIVE" and status == "COMPLETE") else \
+                   "CACHED (DEMO)" if mode == "CACHED" else status
     badge_class = "case-status-ok" if status == "COMPLETE" else \
                   "case-status-warn" if status in ("RUNNING", "CACHED") else "case-status-none"
     st.markdown(f"""
@@ -412,6 +442,32 @@ def view_workspace():
     ev_size = st.session_state.get("evidence_size")
     ev_hash = st.session_state.get("evidence_hash")
     mode = st.session_state.get("analysis_mode")
+    tot_time = st.session_state.get("analysis_total_elapsed", 0.0)
+
+    # Top Live Analysis Success Banner
+    if status == "COMPLETE" and mode == "LIVE":
+        st.markdown(f"""
+        <div style='background:rgba(63,185,80,0.08);border:1px solid rgba(63,185,80,0.3);border-radius:6px;padding:10px 16px;margin-bottom:14px;display:flex;justify-content:space-between;align-items:center;'>
+          <div>
+            <span style='color:#3fb950;font-weight:700;font-size:0.88rem;'>✓ LIVE ANALYSIS COMPLETE</span>
+            <span style='color:#8b949e;font-size:0.75rem;margin-left:14px;'>Elapsed: <b style='color:#e6edf3;'>{tot_time:.2f}s</b> | Evidence: <b style='color:#e6edf3;'>{ev_name}</b> | Case: <b style='color:#58a6ff;'>{st.session_state.get("case_id")}</b></span>
+          </div>
+          <div>
+            <span class='badge badge-pass'>LIVE DATA</span>
+          </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        qb1, qb2, qb3, qb4 = st.columns(4)
+        with qb1:
+            if st.button("📊 Ranked Results", key="qb_ranked", use_container_width=True): navigate("ranked_results"); st.rerun()
+        with qb2:
+            if st.button("🕸 Relationship Graph", key="qb_graph", use_container_width=True): navigate("relationship_graph"); st.rerun()
+        with qb3:
+            if st.button("📝 Narrative Report", key="qb_nar", use_container_width=True): navigate("narrative_report"); st.rerun()
+        with qb4:
+            if st.button("🧪 Ground Truth Benchmark", key="qb_bm", use_container_width=True): navigate("benchmark"); st.rerun()
+        st.markdown("<hr class='cs-divider'>", unsafe_allow_html=True)
 
     short_hash = (ev_hash[:16] + "...") if ev_hash else "NOT COMPUTED"
 
@@ -440,7 +496,7 @@ def view_workspace():
         with sb2:
             if st.button("🔐 Hash", use_container_width=True): navigate("evidence_verify"); st.rerun()
         if ev_path and os.path.exists(ev_path):
-            if st.button("▶ Analyze", type="primary", use_container_width=True): navigate("evidence_intake"); st.rerun()
+            if st.button("▶ Analyze Evidence", type="primary", use_container_width=True): navigate("evidence_intake"); st.rerun()
 
     with c2:
         st.markdown("<div class='cs-section-label' style='margin-top:0;'>Case Summary</div>", unsafe_allow_html=True)
@@ -456,29 +512,37 @@ def view_workspace():
             with k5: render_kpi_card("ORPHANS", len(results.orphans))
             with k6: render_kpi_card("AVG INT", f"{avg_int:.1f}")
         else:
-            render_empty_state("No analysis loaded", "Load precomputed cache or run pipeline.")
+            render_empty_state("No analysis loaded for current evidence", "Go to Evidence Intake and click 'Analyze Evidence'.")
 
     st.markdown("<hr class='cs-divider'>", unsafe_allow_html=True)
     col_pip, col_top = st.columns(2)
 
     with col_pip:
-        st.markdown("<div class='cs-section-label'>Forensic Pipeline</div>", unsafe_allow_html=True)
+        st.markdown("<div class='cs-section-label'>Forensic Pipeline Execution Status</div>", unsafe_allow_html=True)
         log = st.session_state.get("pipeline_log", [])
-        log_map = {l["stage"]: l["status"] for l in log}
+        log_map = {l["stage"]: l for l in log}
         stages = ["Evidence", "Stage 1 — Carving", "Stage 2 — Fingerprinting",
                   "Stage 3 — Relationships & Reconstruction", "Stage 4+5 — Sensitivity & Priority",
                   "Stage 6 — Narrative Report", "Stage 7 — Benchmark Evaluation"]
         html = ""
         for i, stage in enumerate(stages):
             if stage == "Evidence":
-                dot, css = ("✓", "step-done") if ev_path else ("○", "step-idle")
+                dot, css, t_info = ("✓", "step-done", "") if ev_path else ("○", "step-idle", "")
             else:
-                s = log_map.get(stage)
-                if s == "COMPLETE": dot, css = "✓", "step-done"
-                elif s == "RUNNING": dot, css = "●", "step-run"
-                elif arts and status == "COMPLETE": dot, css = "✓", "step-done"
-                else: dot, css = "○", "step-idle"
-            html += f"<div class='pipeline-step'><span class='{css}'>{dot}</span><span style='color:#c9d1d9;'>{stage}</span></div>"
+                s_info = log_map.get(stage)
+                if s_info and s_info.get("status") == "COMPLETE":
+                    dot, css = "✓", "step-done"
+                    t_info = f"<span style='color:#8b949e;font-size:0.7rem;margin-left:auto;font-family:JetBrains Mono,monospace;'>{s_info.get('elapsed', 0.0):.2f}s</span>"
+                elif s_info and s_info.get("status") == "RUNNING":
+                    dot, css = "●", "step-run"
+                    t_info = "<span style='color:#d29922;font-size:0.7rem;margin-left:auto;'>running</span>"
+                elif arts and status == "COMPLETE":
+                    dot, css = "✓", "step-done"
+                    t_info = ""
+                else:
+                    dot, css = "○", "step-idle"
+                    t_info = ""
+            html += f"<div class='pipeline-step'><span class='{css}'>{dot}</span><span style='color:#c9d1d9;'>{stage}</span>{t_info}</div>"
             if i < len(stages)-1: html += "<div style='padding-left:5px;color:#484f58;font-size:0.65rem;line-height:0.7;'>│</div>"
         st.markdown(f"<div style='padding:6px 0;'>{html}</div>", unsafe_allow_html=True)
         if status == "COMPLETE" and st.session_state.get("analysis_timestamp"):
@@ -517,16 +581,8 @@ def view_workspace():
               </table>
             </div>""", unsafe_allow_html=True)
 
-            metrics = arts["metrics"]
-            g1,g2,g3 = st.columns(3)
-            with g1: st.metric("Precision", f"{metrics.get('precision',0)*100:.1f}%")
-            with g2: st.metric("Recall", f"{metrics.get('recall',0)*100:.1f}%")
-            with g3: st.metric("F1", f"{metrics.get('f1_score',0)*100:.1f}%")
-            if st.button("→ View Benchmark", use_container_width=True): navigate("benchmark"); st.rerun()
-
 
 def view_evidence_intake():
-    import time
     render_page_header("EVIDENCE INTAKE", "Select a forensic evidence image or generate synthetic demo data.")
     tab_a, tab_b = st.tabs(["A — Analyze Existing Evidence", "B — Generate Demo Evidence"])
 
@@ -535,6 +591,8 @@ def view_evidence_intake():
              border-radius:6px;padding:10px 14px;margin-bottom:14px;font-size:0.78rem;color:#8b949e;'>
             Upload or select a forensic disk image (.dd, .raw, .img). Analysis is strictly read-only.
         </div>""", unsafe_allow_html=True)
+
+        is_running = st.session_state.get("analysis_running", False)
 
         # Auto-detect staged evidence files in repository
         staged_candidates = []
@@ -554,36 +612,50 @@ def view_evidence_intake():
                 with sc_cols[i % len(sc_cols)]:
                     is_cur = st.session_state.get("evidence_path") == cand
                     btn_type = "primary" if is_cur else "secondary"
-                    if st.button(f"📄 {c_name} ({c_sz})", key=f"quick_ev_{i}", use_container_width=True, type=btn_type):
+                    if st.button(f"📄 {c_name} ({c_sz})", key=f"quick_ev_{i}", use_container_width=True, type=btn_type, disabled=is_running):
                         st.session_state.update({
                             "evidence_path": cand, "evidence_hash": None,
                             "evidence_size": None, "evidence_filename": None,
-                            "case_id": f"CASE-2026-{c_name[:4].upper()}"
+                            "case_id": f"CASE-2026-{c_name[:6].upper().replace('.', '_')}",
+                            "analysis_status": "NOT_RUN", "analysis_mode": None,
+                            "analysis_error": None, "analysis_running": False,
+                            "artifacts": None, "artifacts_error": None, "pipeline_log": [],
                         })
                         ensure_evidence_hash()
                         st.rerun()
 
-        uploaded = st.file_uploader("Or Upload New Evidence File", type=["dd","raw","img","bin","e01"])
+        uploaded = st.file_uploader("Or Upload New Evidence File", type=["dd","raw","img","bin","e01"], disabled=is_running)
         local_path = st.text_input("Or Specify Custom Path",
             value=st.session_state.get("evidence_path") or "",
-            placeholder="e.g. cases/evidence_staging/L1_Documents.dd or data/evidence.raw")
+            placeholder="e.g. cases/evidence_staging/L1_Documents.dd or data/evidence.raw",
+            disabled=is_running)
 
         if uploaded:
             os.makedirs("cases/evidence_staging", exist_ok=True)
             dest = os.path.join("cases", "evidence_staging", uploaded.name).replace("\\", "/")
             with open(dest, "wb") as f: f.write(uploaded.read())
-            st.session_state.update({"evidence_path": dest, "evidence_hash": None,
-                                     "evidence_size": None, "evidence_filename": None,
-                                     "case_id": f"CASE-{datetime.date.today().strftime('%Y%m%d')}-{uploaded.name[:4].upper()}"})
+            st.session_state.update({
+                "evidence_path": dest, "evidence_hash": None,
+                "evidence_size": None, "evidence_filename": None,
+                "case_id": f"CASE-{datetime.date.today().strftime('%Y%m%d')}-{uploaded.name[:6].upper().replace('.', '_')}",
+                "analysis_status": "NOT_RUN", "analysis_mode": None,
+                "analysis_error": None, "analysis_running": False,
+                "artifacts": None, "artifacts_error": None, "pipeline_log": [],
+            })
             ensure_evidence_hash()
             st.success(f"Evidence staged: {dest}")
             st.rerun()
         elif local_path and local_path != st.session_state.get("evidence_path"):
             if os.path.exists(local_path):
-                if st.button("Load This Evidence Path"):
-                    st.session_state.update({"evidence_path": local_path, "evidence_hash": None,
-                                             "evidence_size": None, "evidence_filename": None,
-                                             "case_id": f"CASE-{datetime.date.today().strftime('%Y%m%d')}-EVD"})
+                if st.button("Load This Evidence Path", disabled=is_running):
+                    st.session_state.update({
+                        "evidence_path": local_path, "evidence_hash": None,
+                        "evidence_size": None, "evidence_filename": None,
+                        "case_id": f"CASE-{datetime.date.today().strftime('%Y%m%d')}-EVD",
+                        "analysis_status": "NOT_RUN", "analysis_mode": None,
+                        "analysis_error": None, "analysis_running": False,
+                        "artifacts": None, "artifacts_error": None, "pipeline_log": [],
+                    })
                     ensure_evidence_hash()
                     st.rerun()
             elif local_path:
@@ -603,67 +675,114 @@ def view_evidence_intake():
             st.markdown(f"<div class='hash-block'>SHA-256: {ev_hash}</div>", unsafe_allow_html=True)
             st.markdown("<hr class='cs-divider'>", unsafe_allow_html=True)
 
-            is_running = st.session_state.get("analysis_running", False)
+            # Error Persistence UI if previous run failed
+            if st.session_state.get("analysis_status") == "ERROR" and st.session_state.get("analysis_error"):
+                st.markdown(f"""
+                <div style='background:rgba(248,81,73,0.1);border:1px solid rgba(248,81,73,0.4);border-radius:6px;padding:12px 16px;margin-bottom:14px;'>
+                  <div style='color:#f85149;font-weight:700;font-size:0.85rem;'>ANALYSIS FAILED</div>
+                  <div style='color:#c9d1d9;font-size:0.8rem;margin-top:4px;'><b>Reason:</b> {st.session_state.get("analysis_error")}</div>
+                </div>
+                """, unsafe_allow_html=True)
+
             c_run, c_cache = st.columns(2)
             with c_run:
                 if st.button("▶ Analyze Evidence", type="primary", use_container_width=True, disabled=is_running):
+                    # Setup separate run directory: runs/CASE-XXXXXXXX/
+                    case_tag = f"CASE-{datetime.date.today().strftime('%Y%m%d')}-{os.path.basename(ev_path)[:6].upper().replace('.', '_')}"
+                    run_dir = os.path.join("runs", case_tag).replace("\\", "/")
+                    os.makedirs(run_dir, exist_ok=True)
+
+                    st.session_state["case_id"] = case_tag
+                    st.session_state["active_output_dir"] = run_dir
                     st.session_state["analysis_running"] = True
                     st.session_state["analysis_status"] = "RUNNING"
+                    st.session_state["analysis_error"] = None
                     st.session_state["artifacts"] = None
                     st.session_state["pipeline_log"] = []
+                    st.session_state["analysis_started_at"] = datetime.datetime.now().isoformat(timespec="seconds")
 
-                    live_container = st.container()
-                    with live_container:
-                        st.markdown("<div class='cs-section-label'>Live Pipeline Progress</div>", unsafe_allow_html=True)
+                    # Live Progress Visualizer Container
+                    prog_container = st.container()
+                    with prog_container:
+                        st.markdown("<div class='cs-section-label'>Live Forensic Pipeline Execution</div>", unsafe_allow_html=True)
                         prog_bar = st.progress(0)
                         status_box = st.empty()
-                        detail_box = st.empty()
+                        time_box = st.empty()
+                        history_box = st.empty()
                         t_overall_start = time.perf_counter()
 
-                        def on_progress(stage_name, status, percent, elapsed_stage):
+                        def on_progress(stage_name, status_str, percent, elapsed_stage):
                             t_tot = time.perf_counter() - t_overall_start
+                            st.session_state["analysis_stage"] = stage_name
+                            st.session_state["analysis_percent"] = percent
+                            st.session_state["analysis_stage_elapsed"] = elapsed_stage
+                            st.session_state["analysis_total_elapsed"] = t_tot
+                            
                             prog_bar.progress(min(100, int(percent)))
-                            icon = "●" if status == "RUNNING" else ("✓" if status == "COMPLETE" else "✗")
-                            col = "#d29922" if status == "RUNNING" else ("#3fb950" if status == "COMPLETE" else "#f85149")
-                            status_box.markdown(f"<div style='font-size:0.88rem;color:{col};font-weight:600;'>{icon} {stage_name} ({status})</div>", unsafe_allow_html=True)
-                            detail_box.markdown(f"<div style='font-size:0.75rem;color:#8b949e;'>Stage time: <code>{elapsed_stage:.2f}s</code> | Overall elapsed: <code>{t_tot:.2f}s</code></div>", unsafe_allow_html=True)
+                            icon = "●" if status_str == "RUNNING" else ("✓" if status_str == "COMPLETE" else "✗")
+                            col = "#d29922" if status_str == "RUNNING" else ("#3fb950" if status_str == "COMPLETE" else "#f85149")
+                            status_box.markdown(f"<div style='font-size:0.9rem;color:{col};font-weight:600;'>{icon} {stage_name} ({status_str})</div>", unsafe_allow_html=True)
+                            time_box.markdown(f"<div style='font-size:0.76rem;color:#8b949e;'>Stage: <code>{elapsed_stage:.2f}s</code> | Overall: <code>{t_tot:.2f}s</code></div>", unsafe_allow_html=True)
+                            
+                            log_items = st.session_state.get("pipeline_log", [])
+                            if log_items:
+                                h_html = "".join([f"<div style='font-size:0.74rem;color:#8b949e;'><span style='color:{'#3fb950' if x['status']=='COMPLETE' else ('#d29922' if x['status']=='RUNNING' else '#f85149')}'>{'✓' if x['status']=='COMPLETE' else ('●' if x['status']=='RUNNING' else '✗')}</span> {x['stage']} — {x.get('elapsed', 0.0):.2f}s</div>" for x in log_items])
+                                history_box.markdown(f"<div style='background:#0d1117;border:1px solid #21262d;border-radius:4px;padding:6px 10px;margin-top:6px;'>{h_html}</div>", unsafe_allow_html=True)
 
                         try:
-                            success, err = execute_pipeline(ev_path, DATA_DIR, progress_callback=on_progress)
+                            success, err = execute_pipeline(ev_path, run_dir, progress_callback=on_progress)
+                            t_total = time.perf_counter() - t_overall_start
                             if success:
-                                arts, art_err = load_artifacts(DATA_DIR)
+                                arts, art_err = load_artifacts(run_dir)
                                 st.session_state["artifacts"] = arts
                                 st.session_state["artifacts_error"] = art_err
-                                st.success("Pipeline complete.")
+                                st.session_state["analysis_status"] = "COMPLETE"
+                                st.session_state["analysis_mode"] = "LIVE"
+                                st.session_state["analysis_total_elapsed"] = t_total
+                                st.session_state["analysis_finished_at"] = datetime.datetime.now().isoformat(timespec="seconds")
+                                st.session_state["view"] = "workspace"
+                                st.rerun()
                             else:
-                                render_error_card("Pipeline", str(err))
+                                st.session_state["analysis_status"] = "ERROR"
+                                st.session_state["analysis_error"] = str(err)
+                                render_error_card("Pipeline Execution", str(err))
+                        except Exception as ex:
+                            st.session_state["analysis_status"] = "ERROR"
+                            st.session_state["analysis_error"] = str(ex)
+                            render_error_card("Pipeline Execution", str(ex), traceback.format_exc())
                         finally:
                             st.session_state["analysis_running"] = False
-                    st.rerun()
 
             with c_cache:
                 if st.button("📂 Load Precomputed Cache", use_container_width=True, disabled=is_running):
                     arts, err = load_artifacts(DATA_DIR)
                     if arts:
-                        st.session_state.update({"artifacts": arts, "artifacts_error": None,
-                                                 "analysis_status": "COMPLETE", "analysis_mode": "CACHED"})
-                        if not st.session_state.get("evidence_hash"):
-                            st.session_state.update({"evidence_hash": arts["results"].evidence_image_hash,
-                                                     "evidence_filename": "evidence.raw (cached)", "case_id": "CASE-2026-DEMO"})
+                        st.session_state.update({
+                            "active_output_dir": DATA_DIR,
+                            "artifacts": arts, "artifacts_error": None,
+                            "analysis_status": "COMPLETE", "analysis_mode": "CACHED",
+                            "analysis_error": None,
+                            "evidence_hash": arts["results"].evidence_image_hash,
+                            "evidence_filename": "evidence.raw (cached)", "case_id": "CASE-2026-DEMO"
+                        })
                         st.success("Cache loaded."); st.rerun()
                     else: st.error(f"Cache load failed: {err}")
         else:
             st.markdown("<hr class='cs-divider'>", unsafe_allow_html=True)
             if os.path.exists(os.path.join(DATA_DIR, "ranked_results.json")):
-                st.info("Precomputed artifacts detected in data/. Load without re-running the pipeline.")
-                if st.button("📂 Load Precomputed Cache", use_container_width=True):
+                st.info("Precomputed demo artifacts detected in data/. Load without re-running the pipeline.")
+                if st.button("📂 Load Precomputed Cache", use_container_width=True, disabled=is_running):
                     arts, err = load_artifacts(DATA_DIR)
                     if arts:
-                        st.session_state.update({"artifacts": arts, "artifacts_error": None,
-                                                 "analysis_status": "COMPLETE", "analysis_mode": "CACHED",
-                                                 "evidence_hash": arts["results"].evidence_image_hash,
-                                                 "evidence_filename": "evidence.raw (cached)",
-                                                 "case_id": "CASE-2026-DEMO"})
+                        st.session_state.update({
+                            "active_output_dir": DATA_DIR,
+                            "artifacts": arts, "artifacts_error": None,
+                            "analysis_status": "COMPLETE", "analysis_mode": "CACHED",
+                            "analysis_error": None,
+                            "evidence_hash": arts["results"].evidence_image_hash,
+                            "evidence_filename": "evidence.raw (cached)",
+                            "case_id": "CASE-2026-DEMO"
+                        })
                         st.rerun()
                     else: st.error(f"Failed: {err}")
 
@@ -672,12 +791,15 @@ def view_evidence_intake():
              border-radius:6px;padding:10px 14px;margin-bottom:14px;font-size:0.78rem;color:#d29922;'>
             ⚠ DEMO MODE — generates synthetic 50MB evidence and runs full pipeline. Overwrites data/evidence.raw.
         </div>""", unsafe_allow_html=True)
-        if st.button("⚙ Generate Synthetic Demo Case", type="secondary", use_container_width=True):
+        if st.button("⚙ Generate Synthetic Demo Case", type="secondary", use_container_width=True, disabled=is_running):
             from modules.generate_data import main as run_generate_data
             with st.spinner("Generating synthetic evidence..."):
                 run_generate_data()
-            st.session_state.update({"evidence_path": "data/evidence.raw", "evidence_hash": None,
-                                     "evidence_size": None, "evidence_filename": None, "case_id": "CASE-2026-DEMO"})
+            st.session_state.update({
+                "evidence_path": "data/evidence.raw", "evidence_hash": None,
+                "evidence_size": None, "evidence_filename": None, "case_id": "CASE-2026-DEMO",
+                "active_output_dir": DATA_DIR
+            })
             ensure_evidence_hash()
             st.success("Synthetic evidence generated. Click 'Load Precomputed Cache' or run pipeline.")
 
@@ -719,630 +841,358 @@ def view_overview():
     arts = require_artifacts()
     if not arts: return
     results = arts["results"]; clusters = arts["clusters"]; fragments = arts["fragments"]; metrics = arts["metrics"]
-    mean_int = sum(f.integrity_score for f in results.files) / max(1, len(results.files))
-    mean_pri = sum(f.priority_score for f in results.files) / max(1, len(results.files))
-    k1,k2,k3,k4,k5 = st.columns(5)
-    with k1: render_kpi_card("FRAGMENTS", len(fragments))
-    with k2: render_kpi_card("CLUSTERS", len(clusters))
-    with k3: render_kpi_card("RECOVERED", len(results.files))
-    with k4: render_kpi_card("AVG INTEGRITY", f"{mean_int:.1f}")
-    with k5: render_kpi_card("AVG PRIORITY", f"{mean_pri:.1f}")
-    st.markdown("<hr class='cs-divider'>", unsafe_allow_html=True)
-    col1, col2 = st.columns(2)
-    from collections import Counter
-    with col1:
-        tc = Counter(f.type_hint.upper() for f in fragments)
-        df_t = pd.DataFrame({"Type": list(tc.keys()), "Count": list(tc.values())})
-        fig = px.bar(df_t, x="Type", y="Count", title="Fragment Type Distribution",
-                     color="Type", color_discrete_map={k.upper(): v for k,v in TC_MAP.items()})
-        fig.update_layout(**PLT_LAYOUT, title_font=dict(size=12,color="#c9d1d9"), height=240, showlegend=False)
-        fig.update_yaxes(gridcolor="#21262d"); st.plotly_chart(fig, use_container_width=True)
 
-        ents = [f.entropy for f in fragments]
-        fig2 = go.Figure(go.Histogram(x=ents, nbinsx=20, marker=dict(color="#58a6ff", opacity=0.8)))
-        fig2.add_vline(x=3.5, line_dash="dash", line_color="#d29922", annotation_text="TEXT", annotation_font_size=9)
-        fig2.add_vline(x=7.5, line_dash="dash", line_color="#f85149", annotation_text="BINARY", annotation_font_size=9)
-        fig2.update_layout(**PLT_LAYOUT, title="Entropy Distribution", title_font=dict(size=12,color="#c9d1d9"), height=240)
-        fig2.update_xaxes(gridcolor="#21262d", title_text="Shannon Entropy"); fig2.update_yaxes(gridcolor="#21262d")
+    k1,k2,k3,k4,k5,k6 = st.columns(6)
+    full = sum(1 for f in results.files if f.structural_validity == "PASS" and f.gap_count == 0)
+    avg_int = sum(f.integrity_score for f in results.files) / max(1, len(results.files))
+    with k1: render_kpi_card("CARVED FRAGS", len(fragments))
+    with k2: render_kpi_card("DBSCAN CLUSTERS", len(clusters))
+    with k3: render_kpi_card("RECON FILES", len(results.files))
+    with k4: render_kpi_card("FULL RECOVERY", full)
+    with k5: render_kpi_card("ORPHANS", len(results.orphans))
+    with k6: render_kpi_card("AVG INTEGRITY", f"{avg_int:.1f}")
+
+    st.markdown("<hr class='cs-divider'>", unsafe_allow_html=True)
+    c1, c2 = st.columns(2)
+
+    with c1:
+        st.markdown("<div class='cs-section-label'>File Type Distribution</div>", unsafe_allow_html=True)
+        tc = pd.DataFrame([{"Type": f.file_type.upper(), "Count": 1} for f in results.files]).groupby("Type").count().reset_index()
+        fig = px.pie(tc, names="Type", values="Count", hole=0.55,
+                     color="Type", color_discrete_map={"PDF":"#58a6ff","JPEG":"#d29922","TEXT":"#3fb950","BINARY":"#8b949e"})
+        fig.update_layout(**PLT_LAYOUT, height=220, showlegend=True)
+        st.plotly_chart(fig, use_container_width=True)
+
+    with c2:
+        st.markdown("<div class='cs-section-label'>Priority Score Breakdown</div>", unsafe_allow_html=True)
+        df_p = pd.DataFrame([{"ID": f.id, "Priority": f.priority_score, "Integrity": f.integrity_score} for f in results.files])
+        fig2 = px.bar(df_p, x="ID", y="Priority", color="Integrity",
+                      color_continuous_scale=[[0,"#f85149"],[0.5,"#d29922"],[1,"#3fb950"]])
+        fig2.update_layout(**PLT_LAYOUT, height=220)
         st.plotly_chart(fig2, use_container_width=True)
 
-    with col2:
-        fig3 = px.bar(x=[f.id for f in results.files], y=[f.integrity_score for f in results.files],
-                      title="Integrity Scores", color=[f.integrity_score for f in results.files],
-                      color_continuous_scale=[[0,"#f85149"],[0.5,"#d29922"],[1,"#3fb950"]], range_color=[0,100],
-                      labels={"x":"Artifact","y":"Integrity"})
-        fig3.update_layout(**PLT_LAYOUT, title_font=dict(size=12,color="#c9d1d9"), height=240, coloraxis_showscale=False)
-        st.plotly_chart(fig3, use_container_width=True)
-
-        statuses = []
-        for f in results.files:
-            if f.structural_validity == "PASS" and f.gap_count == 0: statuses.append("FULL")
-            elif f.gap_count > 0: statuses.append("PARTIAL")
-            else: statuses.append("FAILED")
-        sc = Counter(statuses)
-        for _ in results.orphans: sc["ORPHAN"] += 1
-        fig4 = px.pie(values=list(sc.values()), names=list(sc.keys()), title="Recovery Status",
-                      color_discrete_map={"FULL":"#3fb950","PARTIAL":"#d29922","FAILED":"#f85149","ORPHAN":"#6e7681"}, hole=0.4)
-        fig4.update_layout(**PLT_LAYOUT, title_font=dict(size=12,color="#c9d1d9"), height=240,
-                           legend=dict(font=dict(color="#8b949e",size=10)))
-        st.plotly_chart(fig4, use_container_width=True)
+    st.markdown("<div class='cs-section-label'>Top Ranked Evidence Artifacts</div>", unsafe_allow_html=True)
+    rows = []
+    for f in results.files[:8]:
+        rows.append({
+            "Rank": f.id, "Type": f.file_type.upper(), "Frags": len(f.fragment_ids),
+            "Gaps": f.gap_count, "Validity": f.structural_validity,
+            "Integrity": f"{f.integrity_score:.1f}", "Priority": f"{f.priority_score:.1f}",
+            "Sensitivity Hits": f.sensitivity_hit_count
+        })
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
 
 def view_recovered_files():
-    render_page_header("RECOVERED FILES", "Evidence browser — reconstructed artifact inventory.")
+    render_page_header("RECOVERED FILES", "All candidate files assembled from cluster streams.")
     arts = require_artifacts()
     if not arts: return
     results = arts["results"]
-    c_s,c_t,c_sort = st.columns([2,1,1])
-    with c_s: search = st.text_input("Search","",placeholder="ID or type...", label_visibility="collapsed")
-    with c_t:
-        types = ["All"] + sorted(set(f.file_type.upper() for f in results.files))
-        filter_type = st.selectbox("Type", types, label_visibility="collapsed")
-    with c_sort:
-        sort_by = st.selectbox("Sort", ["Priority ↓","Integrity ↓","Sensitivity ↓","Fragments ↓"], label_visibility="collapsed")
-    files = results.files
-    if search: files = [f for f in files if search.lower() in f.id.lower() or search.lower() in f.file_type.lower()]
-    if filter_type != "All": files = [f for f in files if f.file_type.upper() == filter_type]
-    sk = {"Priority ↓": lambda f:-f.priority_score, "Integrity ↓": lambda f:-f.integrity_score,
-          "Sensitivity ↓": lambda f:-f.sensitivity_hit_count, "Fragments ↓": lambda f:-len(f.fragment_ids)}
-    files = sorted(files, key=sk[sort_by])
-    st.markdown("<hr class='cs-divider'>", unsafe_allow_html=True)
-    for rank, f in enumerate(files, 1):
-        rs = "FULL" if f.structural_validity=="PASS" and f.gap_count==0 else "PARTIAL" if f.gap_count>0 else "FAILED"
-        hits_str = ", ".join(f.sensitivity_hits[:3]) + (f" (+{len(f.sensitivity_hits)-3})" if len(f.sensitivity_hits)>3 else "")
-        col_r,col_info,col_scores,col_btn = st.columns([0.3,3,2,1])
-        with col_r: st.markdown(f"<div style='font-family:JetBrains Mono,monospace;color:#484f58;padding-top:10px;'>#{rank:02d}</div>", unsafe_allow_html=True)
-        with col_info:
-            bk = "pass" if rs=="FULL" else "partial" if rs=="PARTIAL" else "fail"
-            st.markdown(f"""
-            <div style='padding:7px 11px;background:#161b22;border:1px solid #21262d;border-radius:6px;'>
-              <div style='display:flex;align-items:center;gap:9px;margin-bottom:3px;'>
-                <span style='font-family:JetBrains Mono,monospace;font-size:0.88rem;color:#58a6ff;font-weight:600;'>{f.id}</span>
-                <span class='badge badge-info'>{f.file_type.upper()}</span>
-                <span class='badge badge-{bk}'>{rs}</span>
-              </div>
-              <div style='font-size:0.72rem;color:#6e7681;'>Cluster: <span style='font-family:JetBrains Mono,monospace;'>{f.cluster_id}</span> · {len(f.fragment_ids)} frags · {f.gap_count} gaps · {f.sensitivity_hit_count} sens.</div>
-              {('<div style="font-size:0.7rem;color:#d29922;margin-top:2px;">⚠ '+hits_str+'</div>') if hits_str else ''}
-            </div>""", unsafe_allow_html=True)
-        with col_scores:
-            s1,s2 = st.columns(2)
-            with s1: st.metric("Integrity",f"{f.integrity_score:.1f}")
-            with s2: st.metric("Priority",f"{f.priority_score:.1f}")
-        with col_btn:
-            if st.button("Inspect →", key=f"ins_{f.id}", use_container_width=True):
-                navigate("file_detail", selected_file_id=f.id); st.rerun()
+
+    t_filter = st.selectbox("Filter by Type", ["All"] + sorted(list(set(f.file_type.upper() for f in results.files))))
+    v_filter = st.selectbox("Filter by Structural Validity", ["All", "PASS", "PARTIAL", "FAIL"])
+
+    filtered = results.files
+    if t_filter != "All": filtered = [f for f in filtered if f.file_type.upper() == t_filter]
+    if v_filter != "All": filtered = [f for f in filtered if f.structural_validity == v_filter]
+
+    st.markdown(f"<div style='font-size:0.75rem;color:#8b949e;margin-bottom:8px;'>Showing {len(filtered)} of {len(results.files)} reconstructed files</div>", unsafe_allow_html=True)
+
+    rows = []
+    for f in filtered:
+        rows.append({
+            "File ID": f.id, "Cluster": f.cluster_id, "Type": f.file_type.upper(),
+            "Frags": len(f.fragment_ids), "Gap Count": f.gap_count, "Gap Bytes": f.gap_bytes_total,
+            "Validity": f.structural_validity, "Completeness": f"{f.completeness:.2f}",
+            "Integrity": f"{f.integrity_score:.1f}", "Priority": f"{f.priority_score:.1f}",
+            "Ambiguous": "YES" if f.ambiguous else "NO"
+        })
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
 
 def view_ranked_results():
-    render_page_header("FORENSIC TRIAGE QUEUE", "Artifacts ranked by sensitivity, integrity and priority.")
+    render_page_header("RANKED RESULTS", "Forensic priority triage ranking according to mathematical confidence and sensitivity.")
     arts = require_artifacts()
     if not arts: return
     results = arts["results"]
+
+    st.markdown(f"<div class='hash-block' style='margin-bottom:12px;'>Evidence Image SHA-256: {results.evidence_image_hash}</div>", unsafe_allow_html=True)
+
     rows = []
     for rank, f in enumerate(results.files, 1):
-        rs = "FULL" if f.structural_validity=="PASS" and f.gap_count==0 else "PARTIAL" if f.gap_count>0 else "FAILED"
-        rows.append({"Rank": f"#{rank:02d}", "Artifact": f.id, "Type": f.file_type.upper(), "Cluster": f.cluster_id,
-                     "Recovery": rs, "Integrity": round(f.integrity_score,1), "Priority": round(f.priority_score,1),
-                     "Sensitivity": f.sensitivity_hit_count, "Fragments": len(f.fragment_ids), "Gaps": f.gap_count})
-    df = pd.DataFrame(rows)
-    cf1,cf2 = st.columns(2)
-    with cf1: tf = st.multiselect("Filter type", df["Type"].unique().tolist(), default=[])
-    with cf2: rf = st.multiselect("Filter recovery", ["FULL","PARTIAL","FAILED"], default=[])
-    if tf: df = df[df["Type"].isin(tf)]
-    if rf: df = df[df["Recovery"].isin(rf)]
-    st.dataframe(df, use_container_width=True, hide_index=True,
-                 column_config={"Integrity": st.column_config.ProgressColumn("Integrity", min_value=0, max_value=100, format="%.1f"),
-                                "Priority": st.column_config.ProgressColumn("Priority", min_value=0, max_value=100, format="%.1f")})
-    if results.files:
-        sel = st.selectbox("Open in File Detail:", [f.id for f in results.files])
-        if st.button("→ Open File Detail"): navigate("file_detail", selected_file_id=sel); st.rerun()
+        hits_str = ", ".join(f.sensitivity_hits[:3]) if f.sensitivity_hits else "None"
+        rows.append({
+            "Rank": f"#{rank:02d}", "Artifact ID": f.id, "Cluster": f.cluster_id, "Type": f.file_type.upper(),
+            "Priority Score": f.priority_score, "Integrity Score": f.integrity_score,
+            "Recon Confidence": f.reconstruction_confidence, "Sensitivity Hits": f.sensitivity_hit_count,
+            "Top Signals": hits_str
+        })
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True,
+                 column_config={"Priority Score": st.column_config.ProgressColumn("Priority Score", min_value=0, max_value=100, format="%.1f")})
 
-
-def _plotly_dark(fig, h=260):
-    fig.update_layout(**PLT_LAYOUT, height=h, title_font=dict(size=12,color="#c9d1d9"))
-    fig.update_xaxes(gridcolor="#21262d"); fig.update_yaxes(gridcolor="#21262d")
-    return fig
 
 def view_stage_carving():
-    render_page_header("STAGE 1 — CARVING", "Fragment acquisition and entropy-based triage.")
+    render_page_header("STAGE 1 — CARVING", "Low-level chunk carving and BreadCrumb signature matching.")
     arts = require_artifacts()
     if not arts: return
     fragments = arts["fragments"]
-    ev_path = st.session_state.get("evidence_path") or DATA_DIR+"/evidence.raw"
-    ev_size = st.session_state.get("evidence_size") or (os.path.getsize(ev_path) if os.path.exists(ev_path) else 0)
-    ev_name = st.session_state.get("evidence_filename") or os.path.basename(ev_path)
-    ev_hash = st.session_state.get("evidence_hash") or arts["results"].evidence_image_hash
-    chunk_size = 4096
-    total_chunks = math.ceil(ev_size/chunk_size) if ev_size else 0
-    from collections import Counter
-    tc = Counter(f.type_hint for f in fragments)
+
     c1,c2,c3,c4 = st.columns(4)
-    with c1: render_kpi_card("Evidence Size", fmt_bytes(ev_size))
-    with c2: render_kpi_card("Chunks Scanned", f"{total_chunks:,}")
-    with c3: render_kpi_card("Fragments Retained", len(fragments))
-    with c4: render_kpi_card("Filtered", f"{total_chunks-len(fragments):,}" if total_chunks else "—")
+    with c1: render_kpi_card("TOTAL FRAGMENTS", len(fragments))
+    with c2: render_kpi_card("HEADERS MATCHED", sum(1 for f in fragments if f.header_flag))
+    with c3: render_kpi_card("FOOTERS MATCHED", sum(1 for f in fragments if f.footer_flag))
+    with c4: render_kpi_card("AVG ENTROPY", f"{sum(f.entropy for f in fragments)/max(1, len(fragments)):.2f}")
+
     st.markdown("<hr class='cs-divider'>", unsafe_allow_html=True)
-    col_l, col_r = st.columns(2)
-    with col_l:
-        st.markdown(f"""<div class='cs-panel'>
-        <table style='font-size:0.8rem;width:100%;border-collapse:collapse;'>
-        <tr><td style='color:#6e7681;padding:4px 0;'>Filename</td><td style='font-family:JetBrains Mono,monospace;color:#e6edf3;'>{ev_name}</td></tr>
-        <tr><td style='color:#6e7681;padding:4px 0;'>Size</td><td style='font-family:JetBrains Mono,monospace;color:#e6edf3;'>{fmt_bytes(ev_size)}</td></tr>
-        <tr><td style='color:#6e7681;padding:4px 0;'>Chunk size</td><td style='font-family:JetBrains Mono,monospace;color:#e6edf3;'>{chunk_size} bytes</td></tr>
-        <tr><td style='color:#6e7681;padding:4px 0;'>SHA-256</td><td style='font-family:JetBrains Mono,monospace;color:#58a6ff;font-size:0.68rem;'>{ev_hash[:32]}...</td></tr>
-        </table></div>""", unsafe_allow_html=True)
-        df_t = pd.DataFrame({"Type": [k.upper() for k in tc], "Count": list(tc.values())})
-        fig = px.bar(df_t, x="Type", y="Count", title="Type Distribution", color="Type",
-                     color_discrete_map={k.upper():v for k,v in TC_MAP.items()})
-        st.plotly_chart(_plotly_dark(fig, 200), use_container_width=True)
-    with col_r:
-        df_e = pd.DataFrame({"Offset":[f.offset for f in fragments],"Entropy":[f.entropy for f in fragments],
-                              "Type":[f.type_hint.upper() for f in fragments],"Fragment":[f.id for f in fragments]})
-        fig2 = px.scatter(df_e, x="Offset", y="Entropy", color="Type", hover_data=["Fragment"],
-                          color_discrete_map={k.upper():v for k,v in TC_MAP.items()})
-        fig2.add_hline(y=3.5, line_dash="dash", line_color="#d29922", annotation_text="TEXT <3.5", annotation_font_size=9)
-        fig2.add_hline(y=7.5, line_dash="dash", line_color="#f85149", annotation_text="BINARY >7.5", annotation_font_size=9)
-        fig2.update_layout(**PLT_LAYOUT, title="Entropy vs Offset", title_font=dict(size=12,color="#c9d1d9"),
-                           height=270, legend=dict(font=dict(size=9,color="#8b949e")))
-        fig2.update_xaxes(gridcolor="#21262d"); fig2.update_yaxes(gridcolor="#21262d", range=[0,8.5])
-        st.plotly_chart(fig2, use_container_width=True)
-    st.markdown("<hr class='cs-divider'>", unsafe_allow_html=True)
-    srch = st.text_input("Filter fragments", placeholder="ID, type, pipeline...", label_visibility="collapsed")
-    df_f = pd.DataFrame([{"ID":f.id,"Offset":f"0x{f.offset:06X}","Len":f.length,"Type":f.type_hint.upper(),
-                           "Entropy":round(f.entropy,3),"Pipeline":f.pipeline_tag.upper(),
-                           "H":"✓" if f.header_flag else "—","F":"✓" if f.footer_flag else "—",
-                           "Preview":(f.raw_preview or "")[:50]} for f in fragments])
-    if srch:
-        mask = df_f.apply(lambda row: srch.lower() in row.astype(str).str.lower().str.cat(sep=" "), axis=1)
-        df_f = df_f[mask]
-    st.dataframe(df_f, use_container_width=True, hide_index=True)
+    rows = []
+    for f in fragments[:100]:
+        rows.append({
+            "ID": f.id, "Offset": f"0x{f.offset:06X}", "Length": f"{f.length} B",
+            "Type Hint": f.type_hint.upper(), "Pipeline Tag": f.pipeline_tag,
+            "Entropy": f.entropy, "Header": "✓" if f.header_flag else "—",
+            "Footer": "✓" if f.footer_flag else "—", "Preview": f.raw_preview[:30]
+        })
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    if len(fragments) > 100:
+        st.info(f"Displaying first 100 of {len(fragments)} fragments.")
 
 
 def view_stage_characterization():
-    render_page_header("STAGE 2 — CHARACTERIZATION", "Fragment characterization matrix.")
+    render_page_header("STAGE 2 — CHARACTERIZATION", "Shannon entropy distribution and data triage tagging.")
     arts = require_artifacts()
     if not arts: return
     fragments = arts["fragments"]
-    st.markdown("""<div style='background:rgba(88,166,255,0.06);border:1px solid rgba(88,166,255,0.2);
-         border-radius:6px;padding:9px 13px;font-size:0.76rem;color:#8b949e;margin-bottom:11px;'>
-        <b style='color:#58a6ff;'>Note:</b> Magika secondary verification is applied to fully reconstructed candidates,
-        not individual 4KB raw fragments. Fragment characterization is based on entropy, BreadCrumb signatures, and heuristics.
-    </div>""", unsafe_allow_html=True)
-    rows = [{"Fragment":f.id,"Type Hint":f.type_hint.upper(),"Entropy":round(f.entropy,3),"Pipeline":f.pipeline_tag.upper(),
-             "Header Sig":"✓" if f.header_flag else "—","Footer Sig":"✓" if f.footer_flag else "—",
-             "Printable":"~HIGH" if f.pipeline_tag=="text" else "~LOW" if f.pipeline_tag=="binary" else "~MED",
-             "Magika":"NOT APPLICABLE","Preview":(f.raw_preview or "")[:48]} for f in fragments]
-    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-    from collections import Counter
-    tag_counts = Counter(f.pipeline_tag for f in fragments)
-    st.markdown("<hr class='cs-divider'>", unsafe_allow_html=True)
-    st.markdown("<div class='cs-section-label'>Pipeline Tag Summary</div>", unsafe_allow_html=True)
-    for tag, count in tag_counts.items():
-        pct = count/len(fragments)*100
-        st.markdown(f"""<div style='display:flex;align-items:center;gap:12px;margin:4px 0;font-size:0.78rem;'>
-            <span style='width:70px;font-family:JetBrains Mono,monospace;color:#e6edf3;'>{tag.upper()}</span>
-            <div style='flex:1;background:#21262d;border-radius:3px;height:7px;'>
-                <div style='width:{pct:.0f}%;background:#58a6ff;height:7px;border-radius:3px;'></div>
-            </div>
-            <span style='font-family:JetBrains Mono,monospace;color:#8b949e;width:55px;'>{count}/{len(fragments)}</span>
-        </div>""", unsafe_allow_html=True)
+
+    df_ent = pd.DataFrame([{"Entropy": f.entropy, "Tag": f.pipeline_tag, "Type": f.type_hint} for f in fragments])
+    fig = px.histogram(df_ent, x="Entropy", color="Tag", nbins=40,
+                       color_discrete_map={"binary":"#8b949e","mixed":"#d29922","text":"#3fb950"})
+    fig.update_layout(**PLT_LAYOUT, height=280)
+    st.plotly_chart(fig, use_container_width=True)
 
 
 def view_stage_fingerprinting():
-    render_page_header("STAGE 3 — FINGERPRINTING", "64-dimensional L2-normalized feature vector generation.")
+    render_page_header("STAGE 3 — FINGERPRINTING", "64-dimensional feature vector extraction and L2 normalization.")
     arts = require_artifacts()
     if not arts: return
-    fragments = arts["fragments"]; fvs = arts["feature_vectors"]
-    frag_dict = {f.id: f for f in fragments}
-    col_l, col_r = st.columns(2)
-    with col_l:
-        st.markdown("""<div class='cs-panel'>
-        <div style='font-size:0.7rem;color:#6e7681;text-transform:uppercase;letter-spacing:0.1em;'>Binary Pipeline</div>
-        <ul style='color:#c9d1d9;font-size:0.78rem;margin:5px 0 10px 0;padding-left:14px;line-height:1.8;'>
-        <li>256-bin normalized byte histogram</li><li>2-gram TF-IDF frequency analysis</li>
-        <li>PCA dimensionality reduction → 64D</li><li>L2 normalization</li></ul>
-        <div style='font-size:0.7rem;color:#6e7681;text-transform:uppercase;letter-spacing:0.1em;'>Text Pipeline</div>
-        <ul style='color:#c9d1d9;font-size:0.78rem;margin:5px 0 0 0;padding-left:14px;line-height:1.8;'>
-        <li>Printable ASCII extraction</li><li>Sentence-transformer or TF-IDF fallback</li>
-        <li>PCA → 64D</li><li>L2 normalization</li></ul></div>""", unsafe_allow_html=True)
-        st.markdown("""<div class='cs-panel' style='margin-top:10px;'>
-        <table style='font-size:0.8rem;width:100%;border-collapse:collapse;'>
-        <tr><td style='color:#6e7681;padding:5px 0;'>Vector dimension</td><td style='font-family:JetBrains Mono,monospace;color:#58a6ff;'>64</td></tr>
-        <tr><td style='color:#6e7681;padding:5px 0;'>Normalization</td><td style='font-family:JetBrains Mono,monospace;color:#e6edf3;'>L2</td></tr>
-        <tr><td style='color:#6e7681;padding:5px 0;'>Clustering metric</td><td style='font-family:JetBrains Mono,monospace;color:#e6edf3;'>Cosine</td></tr>
-        <tr><td style='color:#6e7681;padding:5px 0;'>DBSCAN eps</td><td style='font-family:JetBrains Mono,monospace;color:#e6edf3;'>0.35</td></tr>
-        </table></div>""", unsafe_allow_html=True)
-    with col_r:
-        import numpy as np
-        rows = []
-        for fv in fvs:
-            vec = fv.get("vec") or []; fid = fv.get("fragment_id","—"); frag = frag_dict.get(fid)
-            norm = float(np.linalg.norm(vec)) if vec else 0.0
-            rows.append({"Fragment":fid,"Dimension":fv.get("dimension",len(vec)),"‖v‖":round(norm,4),
-                         "Pipeline":frag.pipeline_tag.upper() if frag else "—","Type":frag.type_hint.upper() if frag else "—"})
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-        if fvs:
-            fv0 = fvs[0]; vec = fv0.get("vec",[])
-            if vec:
-                fig = go.Figure(go.Bar(x=list(range(len(vec))), y=vec, marker=dict(color="#58a6ff", opacity=0.7)))
-                fig.update_layout(**PLT_LAYOUT, title=f"Vector — {fv0.get('fragment_id')}",
-                                  title_font=dict(size=11,color="#c9d1d9"), height=180)
-                fig.update_xaxes(title_text="Dimension"); fig.update_yaxes(title_text="Value")
-                st.plotly_chart(fig, use_container_width=True)
-
-
-def _draw_graph(clusters, frag_dict, orphans, show_orphans):
-    tc_map = TC_MAP
-    n = max(1, len(clusters))
-    nx,ny,nt,nc,ns,nl = [],[],[],[],[],[]
-    ex,ey = [],[]
-    for ci, c in enumerate(clusters):
-        cx = 10*math.cos(2*math.pi*ci/n); cy_v = 10*math.sin(2*math.pi*ci/n)
-        nx.append(cx); ny.append(cy_v)
-        nt.append(f"<b>{c.cluster_id}</b><br>Type:{c.type.upper()}<br>Conf:{c.confidence:.2f}<br>Reason:{c.reason}")
-        nc.append(tc_map.get(c.type,"#58a6ff")); ns.append(32); nl.append(c.cluster_id)
-        for ji, fid in enumerate(c.fragment_ids):
-            angle = 2*math.pi*ji/max(1,len(c.fragment_ids))
-            fx=cx+3.8*math.cos(angle); fy=cy_v+3.8*math.sin(angle)
-            nx.append(fx); ny.append(fy)
-            fo = frag_dict.get(fid)
-            nt.append(f"<b>{fid}</b><br>Offset:{fo.offset if fo else '?'}<br>Type:{fo.type_hint if fo else '?'}<br>Entropy:{fo.entropy if fo else '?'}")
-            nc.append(tc_map.get(fo.type_hint if fo else "unknown","#6e7681")); ns.append(16); nl.append("")
-            ex.extend([cx,fx,None]); ey.extend([cy_v,fy,None])
-    if show_orphans:
-        for i,oid in enumerate(orphans):
-            oa = 2*math.pi*i/max(1,len(orphans)); ox=18*math.cos(oa); oy_v=18*math.sin(oa)
-            nx.append(ox); ny.append(oy_v)
-            fo = frag_dict.get(oid)
-            nt.append(f"<b>ORPHAN:{oid}</b><br>Type:{fo.type_hint if fo else '?'}")
-            nc.append("#484f58"); ns.append(13); nl.append(oid)
-    fig = go.Figure()
-    if ex: fig.add_trace(go.Scatter(x=ex,y=ey,mode="lines",line=dict(width=1,color="rgba(110,118,129,0.25)"),hoverinfo="none"))
-    fig.add_trace(go.Scatter(x=nx,y=ny,mode="markers+text",
-        marker=dict(size=ns,color=nc,line=dict(width=1.5,color="#0d1117")),
-        text=nl,textposition="top center",textfont=dict(size=8,color="#c9d1d9"),
-        hoverinfo="text",hovertext=nt,hoverlabel=dict(bgcolor="#21262d",bordercolor="#30363d",font=dict(size=11,color="#e6edf3"))))
-    fig.update_layout(showlegend=False,hovermode="closest",margin=dict(b=10,l=10,r=10,t=10),
-                      xaxis=dict(showgrid=False,zeroline=False,showticklabels=False),
-                      yaxis=dict(showgrid=False,zeroline=False,showticklabels=False),
-                      paper_bgcolor="rgba(0,0,0,0)",plot_bgcolor="rgba(0,0,0,0)")
-    return fig
+    fvs = arts["feature_vectors"]
+    st.markdown(f"<div style='font-size:0.8rem;color:#8b949e;margin-bottom:10px;'>Loaded {len(fvs)} 64-dimensional L2-normalized feature vectors.</div>", unsafe_allow_html=True)
+    rows = []
+    for fv in fvs[:30]:
+        vec = fv.get("vec", [])
+        vec_sample = ", ".join(f"{x:.3f}" for x in vec[:6]) + " ..."
+        rows.append({"Fragment ID": fv.get("fragment_id"), "Dim": fv.get("dimension", 64), "Sample Vector": vec_sample})
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
 
 def view_stage_relationships():
-    render_page_header("STAGE 4 — RELATIONSHIPS & CLUSTERS", "DBSCAN cosine similarity topology.")
+    render_page_header("STAGE 4 — RELATIONSHIPS", "DBSCAN clustering across cosine similarity space.")
     arts = require_artifacts()
     if not arts: return
-    clusters = arts["clusters"]; fragments = arts["fragments"]; frag_dict = {f.id:f for f in fragments}
-    results = arts["results"]
-    c1,c2,c3 = st.columns(3)
-    with c1: render_kpi_card("CLUSTERS", len(clusters))
-    with c2: render_kpi_card("CLUSTERED FRAGS", sum(len(c.fragment_ids) for c in clusters))
-    with c3: render_kpi_card("ORPHANS", len(results.orphans))
-    st.markdown("<hr class='cs-divider'>", unsafe_allow_html=True)
-    fc1,fc2 = st.columns(2)
-    with fc1:
-        all_types = ["All"]+sorted(set(c.type for c in clusters))
-        gtype = st.selectbox("Filter type", all_types, key="sr4_type")
-    with fc2:
-        all_cids = ["All"]+[c.cluster_id for c in clusters]
-        gcid = st.selectbox("Select cluster", all_cids, key="sr4_cid")
-    show_orphans = st.checkbox("Show orphan fragments", value=True, key="sr4_orphans")
-    dc = clusters
-    if gtype != "All": dc = [c for c in dc if c.type==gtype]
-    if gcid != "All": dc = [c for c in dc if c.cluster_id==gcid]
-    fig = _draw_graph(dc, frag_dict, results.orphans, show_orphans)
-    fig.update_layout(height=440)
-    st.plotly_chart(fig, use_container_width=True)
-    if gcid != "All":
-        cl = next((c for c in clusters if c.cluster_id==gcid), None)
-        if cl:
-            st.markdown("<hr class='cs-divider'>", unsafe_allow_html=True)
-            st.markdown(f"""<div class='cs-panel'>
-            <div style='font-family:JetBrains Mono,monospace;color:#58a6ff;font-weight:700;margin-bottom:7px;'>CLUSTER {cl.cluster_id}</div>
-            <table style='font-size:0.8rem;width:100%;border-collapse:collapse;'>
-            <tr><td style='color:#6e7681;padding:4px 0;width:130px;'>Type</td><td style='font-family:JetBrains Mono,monospace;color:#e6edf3;'>{cl.type.upper()}</td></tr>
-            <tr><td style='color:#6e7681;padding:4px 0;'>Fragments</td><td style='font-family:JetBrains Mono,monospace;color:#e6edf3;'>{", ".join(cl.fragment_ids)}</td></tr>
-            <tr><td style='color:#6e7681;padding:4px 0;'>Confidence</td><td style='font-family:JetBrains Mono,monospace;color:#e6edf3;'>{cl.confidence:.2f}</td></tr>
-            <tr><td style='color:#6e7681;padding:4px 0;'>Reason</td><td style='color:#8b949e;'>{cl.reason}</td></tr>
-            </table></div>""", unsafe_allow_html=True)
-    else:
-        for cl in clusters:
-            with st.expander(f"{cl.cluster_id} — {cl.type.upper()} ({len(cl.fragment_ids)} frags, conf {cl.confidence:.2f})"):
-                st.markdown(f"**Fragments:** `{', '.join(cl.fragment_ids)}`  \n**Reason:** {cl.reason}")
+    clusters = arts["clusters"]; results = arts["results"]
+
+    c1,c2 = st.columns(2)
+    with c1: render_kpi_card("CLUSTERS FORMED", len(clusters))
+    with c2: render_kpi_card("ORPHAN FRAGMENTS", len(results.orphans))
+
+    rows = []
+    for c in clusters:
+        rows.append({
+            "Cluster ID": c.cluster_id, "Dominant Type": c.type.upper(),
+            "Fragment Count": len(c.fragment_ids), "Confidence": f"{c.confidence:.2f}",
+            "Reason": c.reason, "Fragment IDs": ", ".join(c.fragment_ids[:6]) + ("..." if len(c.fragment_ids)>6 else "")
+        })
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
 
 def view_stage_reconstruction():
-    render_page_header("STAGE 5 — STRUCTURAL RECONSTRUCTION", "Fragment assembly and format validation.")
+    render_page_header("STAGE 5 — RECONSTRUCTION", "Format-specific file assembly and Google Magika AI verification.")
     arts = require_artifacts()
     if not arts: return
-    results = arts["results"]; frag_dict = {f.id:f for f in arts["fragments"]}
-    for rec in results.files:
-        with st.expander(f"{rec.id} — {rec.file_type.upper()} | Struct:{rec.structural_validity} | Frags:{len(rec.fragment_ids)} | Gaps:{rec.gap_count}"):
-            cl,cr = st.columns(2)
-            with cl:
-                st.markdown(f"""<table style='font-size:0.8rem;width:100%;border-collapse:collapse;'>
-                <tr><td style='color:#6e7681;padding:4px 0;width:130px;'>Candidate</td><td style='font-family:JetBrains Mono,monospace;color:#58a6ff;'>{rec.id}</td></tr>
-                <tr><td style='color:#6e7681;padding:4px 0;'>Cluster</td><td style='font-family:JetBrains Mono,monospace;color:#e6edf3;'>{rec.cluster_id}</td></tr>
-                <tr><td style='color:#6e7681;padding:4px 0;'>Type</td><td style='font-family:JetBrains Mono,monospace;color:#e6edf3;'>{rec.file_type.upper()}</td></tr>
-                <tr><td style='color:#6e7681;padding:4px 0;'>Structural Test</td><td>{status_badge_html(rec.structural_validity)}</td></tr>
-                <tr><td style='color:#6e7681;padding:4px 0;'>Magika</td><td><span class='badge badge-neutral'>SECONDARY VERIFICATION</span></td></tr>
-                <tr><td style='color:#6e7681;padding:4px 0;'>Gaps</td><td style='font-family:JetBrains Mono,monospace;color:#d29922;'>{rec.gap_count} ({rec.gap_bytes_total}B)</td></tr>
-                </table>""", unsafe_allow_html=True)
-            with cr:
-                sf = sorted(rec.fragment_ids, key=lambda fid: frag_dict[fid].offset if fid in frag_dict else 0)
-                html = "<div class='frag-chain'>"
-                for i, fid in enumerate(sf):
-                    fo = frag_dict.get(fid)
-                    html += f"<div class='frag-block'>[{fid}] ← 0x{fo.offset:06X if fo else '?'}</div>"
-                    if fo and i < len(sf)-1:
-                        nfo = frag_dict.get(sf[i+1])
-                        if nfo:
-                            gap = nfo.offset - (fo.offset+fo.length)
-                            html += f"<div class='frag-gap'>  ↓ GAP {gap}B</div>" if gap > 0 else "<div class='frag-arrow'>  ↓</div>"
-                html += "</div>"
-                st.markdown(html, unsafe_allow_html=True)
+    recon = arts["reconstructed"]
+
+    rows = []
+    for r in recon:
+        rows.append({
+            "ID": r.get("id"), "Cluster": r.get("cluster_id"), "Type": r.get("file_type", "").upper(),
+            "Fragments": len(r.get("fragment_ids", [])), "Gaps": r.get("gap_count", 0),
+            "Gap Bytes": r.get("gap_bytes_total", 0), "Validity": r.get("structural_validity"),
+            "Integrity Score": f"{r.get('integrity_score', 0):.1f}", "Priority Score": f"{r.get('priority_score', 0):.1f}"
+        })
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
 
 def view_stage_integrity():
-    render_page_header("STAGE 6 — INTEGRITY SCORING", "Decomposed confidence and composite integrity analysis.")
+    render_page_header("STAGE 6 — INTEGRITY SCORING", "Decomposed confidence signals (validity, completeness, corruption).")
     arts = require_artifacts()
     if not arts: return
     results = arts["results"]
+
     file_ids = [f.id for f in results.files]
-    sel = st.selectbox("Select artifact", file_ids,
-                       index=file_ids.index(st.session_state.get("selected_file_id",file_ids[0]))
-                       if st.session_state.get("selected_file_id") in file_ids else 0)
+    sel = st.selectbox("Select artifact to inspect integrity breakdown", file_ids)
     f = next(x for x in results.files if x.id == sel)
-    col_g, col_b = st.columns([1,2])
-    with col_g:
-        sc = "#3fb950" if f.integrity_score>=80 else "#d29922" if f.integrity_score>=50 else "#f85149"
-        fig = go.Figure(go.Indicator(
-            mode="gauge+number", value=f.integrity_score,
-            number={"font":{"size":34,"color":sc,"family":"JetBrains Mono"}},
-            gauge={"axis":{"range":[0,100],"tickcolor":"#6e7681","tickfont":{"size":9,"color":"#6e7681"}},
-                   "bar":{"color":sc},"bgcolor":"#21262d","bordercolor":"#30363d",
-                   "steps":[{"range":[0,50],"color":"rgba(248,81,73,0.1)"},
-                             {"range":[50,80],"color":"rgba(210,153,34,0.1)"},
-                             {"range":[80,100],"color":"rgba(63,185,80,0.1)"}]}))
-        fig.update_layout(paper_bgcolor="rgba(0,0,0,0)",font=dict(color="#8b949e"),height=210,margin=dict(l=20,r=20,t=20,b=20))
-        st.plotly_chart(fig, use_container_width=True)
-        interp = "PASS" if f.integrity_score>=80 else "PARTIAL" if f.integrity_score>=50 else "FAIL"
-        st.markdown(status_badge_html(interp), unsafe_allow_html=True)
-    with col_b:
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown(f"""
+        <div class='cs-panel'>
+          <div style='font-family:JetBrains Mono,monospace;font-size:1rem;color:#58a6ff;font-weight:700;'>{f.id} ({f.file_type.upper()})</div>
+          <table style='width:100%;font-size:0.8rem;margin-top:8px;'>
+          <tr><td style='color:#6e7681;'>Structural Validity</td><td>{badge(f.structural_validity, 'pass' if f.structural_validity=='PASS' else ('partial' if f.structural_validity=='PARTIAL' else 'fail'))}</td></tr>
+          <tr><td style='color:#6e7681;'>Completeness</td><td style='font-family:JetBrains Mono,monospace;'>{f.completeness:.3f}</td></tr>
+          <tr><td style='color:#6e7681;'>Recon Confidence</td><td style='font-family:JetBrains Mono,monospace;'>{f.reconstruction_confidence:.3f}</td></tr>
+          <tr><td style='color:#6e7681;'>Corruption Estimate</td><td style='font-family:JetBrains Mono,monospace;'>{f.corruption_estimate:.3f}</td></tr>
+          <tr><td style='color:#6e7681;'>Composite Integrity</td><td style='font-family:JetBrains Mono,monospace;color:#3fb950;font-weight:700;'>{f.integrity_score:.1f}/100</td></tr>
+          </table>
+        </div>
+        """, unsafe_allow_html=True)
+    with c2:
         sv = 1.0 if f.structural_validity=="PASS" else 0.5 if f.structural_validity=="PARTIAL" else 0.0
-        comps = [("Structural Validity",sv),("Completeness",f.completeness),
-                 ("Recon Confidence",f.reconstruction_confidence),("1-Corruption",max(0,1-f.corruption_estimate))]
-        for label,val in comps:
-            col = "#3fb950" if val>=0.8 else "#d29922" if val>=0.5 else "#f85149"
-            st.markdown(f"""<div style='margin:5px 0;'>
-                <div style='display:flex;justify-content:space-between;font-size:0.77rem;margin-bottom:2px;'>
-                  <span style='color:#c9d1d9;'>{label}</span><span style='font-family:JetBrains Mono,monospace;color:{col};'>{val:.3f}</span>
-                </div>
-                <div style='background:#21262d;border-radius:3px;height:5px;'>
-                  <div style='width:{val*100:.0f}%;background:{col};height:5px;border-radius:3px;'></div>
-                </div></div>""", unsafe_allow_html=True)
-        st.markdown("<hr class='cs-divider'>", unsafe_allow_html=True)
-        checks = [("Header valid",f.structural_validity!="FAIL"),("Footer valid",f.structural_validity!="FAIL"),
-                  ("Structural parse",f.structural_validity=="PASS"),("No gaps",f.gap_count==0),
-                  ("Completeness >0.9",f.completeness>=0.9),("Low corruption",f.corruption_estimate<0.2)]
-        for lbl, ok in checks:
-            col = "#3fb950" if ok else "#f85149"
-            st.markdown(f"<div style='font-size:0.77rem;color:{col};'>{'✓' if ok else '✗'} {lbl}</div>", unsafe_allow_html=True)
-        st.markdown("<hr class='cs-divider'>", unsafe_allow_html=True)
-        if f.structural_validity=="PASS" and f.gap_count==0 and f.completeness>=0.9:
-            st.success("Structural validation passed. No gaps. High completeness. Suitable for full forensic review.")
-        elif f.structural_validity=="PASS" and f.gap_count>0:
-            st.warning(f"Validation passed with {f.gap_count} gap(s) ({f.gap_bytes_total}B). Partial recovery.")
-        elif f.structural_validity=="PARTIAL":
-            st.warning("Partial structural validation — incomplete structure.")
-        else:
-            st.error("Structural validation failed — corrupted or misclassified fragment.")
+        comps = [("Validity", sv), ("Completeness", f.completeness), ("Confidence", f.reconstruction_confidence), ("1 - Corruption", max(0, 1 - f.corruption_estimate))]
+        df_c = pd.DataFrame({"Signal": [c[0] for c in comps], "Weight": [c[1] for c in comps]})
+        fig = px.bar(df_c, x="Weight", y="Signal", orientation="h", range_x=[0, 1.05],
+                     color="Weight", color_continuous_scale=[[0,"#f85149"],[0.5,"#d29922"],[1,"#3fb950"]])
+        fig.update_layout(**PLT_LAYOUT, height=180, coloraxis_showscale=False)
+        st.plotly_chart(fig, use_container_width=True)
 
 
 def view_stage_recoverability():
-    render_page_header("STAGE 7 — RECOVERABILITY", "Evidence recoverability assessment.")
+    render_page_header("STAGE 7 — RECOVERABILITY", "Evidence recoverability assessment and file export readiness.")
     arts = require_artifacts()
     if not arts: return
     results = arts["results"]
+
     rows = []
     for f in results.files:
-        if f.structural_validity=="PASS" and f.gap_count==0 and f.completeness>=0.9: rec="FULL"
-        elif f.structural_validity in ("PASS","PARTIAL"): rec="PARTIAL"
-        else: rec="FAILED"
-        rows.append({"Artifact":f.id,"Completeness":round(f.completeness,3),"Gaps":f.gap_count,
-                     "Gap Bytes":f.gap_bytes_total,"Struct Valid":f.structural_validity,
-                     "Recon Conf":round(f.reconstruction_confidence,3),"Corruption":round(f.corruption_estimate,3),"Recoverability":rec})
-    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True,
-                 column_config={"Completeness": st.column_config.ProgressColumn("Completeness",min_value=0,max_value=1,format="%.3f"),
-                                "Recon Conf": st.column_config.ProgressColumn("Recon Conf",min_value=0,max_value=1,format="%.3f")})
-    st.markdown("<hr class='cs-divider'>", unsafe_allow_html=True)
-    for f in results.files:
-        if f.structural_validity=="PASS" and f.gap_count==0 and f.completeness>=0.9: rec,col="#3fb950","FULL"
-        elif f.structural_validity in ("PASS","PARTIAL"): rec,col="#d29922","PARTIAL"
-        else: rec,col="#f85149","FAILED"
-        st.markdown(f"""<div style='background:#161b22;border:1px solid #21262d;border-radius:6px;
-             padding:9px 13px;margin-bottom:7px;display:flex;justify-content:space-between;align-items:center;'>
-            <span style='font-family:JetBrains Mono,monospace;color:#58a6ff;font-weight:600;'>{f.id}</span>
-            <span style='font-size:0.73rem;color:#8b949e;'>{f.file_type.upper()} · {len(f.fragment_ids)} frags · {f.gap_count} gaps</span>
-            <span style='font-family:JetBrains Mono,monospace;font-size:0.8rem;color:{rec};font-weight:700;'>{col}</span>
-        </div>""", unsafe_allow_html=True)
+        status_rec = "FULL" if (f.structural_validity=="PASS" and f.gap_count==0 and f.completeness>=0.9) else ("PARTIAL" if f.structural_validity in ("PASS","PARTIAL") else "FAILED")
+        rows.append({
+            "Artifact": f.id, "Type": f.file_type.upper(), "Fragments": len(f.fragment_ids),
+            "Gaps": f.gap_count, "Gap Bytes": f.gap_bytes_total, "Validity": f.structural_validity,
+            "Integrity": f"{f.integrity_score:.1f}", "Recoverability Status": status_rec
+        })
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
 
 def view_stage_classification():
-    render_page_header("STAGE 8 — CLASSIFICATION & PRIORITY", "Sensitivity, YARA, and triage priority scoring.")
+    render_page_header("STAGE 8 — CLASSIFICATION & PRIORITY", "Sensitivity, YARA ruleset threat detection, and triage priority scoring.")
     arts = require_artifacts()
     if not arts: return
     results = arts["results"]
+
     file_ids = [f.id for f in results.files]
-    sel = st.selectbox("Select artifact", file_ids,
-                       index=file_ids.index(st.session_state.get("selected_file_id",file_ids[0]))
-                       if st.session_state.get("selected_file_id") in file_ids else 0)
+    sel = st.selectbox("Select artifact", file_ids)
     f = next(x for x in results.files if x.id == sel)
-    col_l,col_r = st.columns(2)
-    with col_l:
-        st.markdown("<div class='cs-section-label'>File Classification</div>", unsafe_allow_html=True)
-        st.markdown(f"""<div class='cs-panel'><table style='font-size:0.8rem;width:100%;border-collapse:collapse;'>
-        <tr><td style='color:#6e7681;padding:5px 0;width:130px;'>Artifact type</td><td style='font-family:JetBrains Mono,monospace;color:#e6edf3;'>{f.file_type.upper()}</td></tr>
-        <tr><td style='color:#6e7681;padding:5px 0;'>Sensitivity hits</td><td style='font-family:JetBrains Mono,monospace;color:#d29922;'>{f.sensitivity_hit_count}</td></tr>
-        <tr><td style='color:#6e7681;padding:5px 0;'>Ambiguous</td><td>{"<span class='badge badge-partial'>YES</span>" if f.ambiguous else "<span class='badge badge-pass'>NO</span>"}</td></tr>
-        </table></div>""", unsafe_allow_html=True)
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("<div class='cs-section-label'>Sensitivity Detections</div>", unsafe_allow_html=True)
         if f.sensitivity_hits:
             hits_html = " ".join([f"<span class='badge badge-{'fail' if 'KEY' in h or 'Credential' in h or 'CARD' in h else 'partial'}'>{h}</span>" for h in f.sensitivity_hits])
             st.markdown(f"<div style='line-height:2.3;margin-top:8px;'>{hits_html}</div>", unsafe_allow_html=True)
-        else: st.info("No sensitivity detections.")
-        st.markdown("<div style='font-size:0.7rem;color:#6e7681;margin-top:8px;line-height:1.6;'>Detected by: <b style='color:#8b949e;'>Presidio NLP</b> (PERSON, CREDIT_CARD, etc.) + <b style='color:#8b949e;'>YARA ruleset</b> (PrivateKey, CorporateCredentials, ConfidentialMemo)</div>", unsafe_allow_html=True)
-    with col_r:
+        else:
+            st.info("No sensitivity hits detected.")
+        st.markdown(f"<div style='margin-top:10px;font-size:0.78rem;color:#8b949e;'>Total Detections: <b>{f.sensitivity_hit_count}</b></div>", unsafe_allow_html=True)
+    with c2:
         sc = "#f85149" if f.priority_score>=85 else "#d29922" if f.priority_score>=65 else "#3fb950"
-        st.markdown(f"""<div style='text-align:center;padding:16px 0;'>
-            <div style='font-family:JetBrains Mono,monospace;font-size:3.2rem;font-weight:700;color:{sc};line-height:1;'>{f.priority_score:.1f}</div>
-            <div style='font-size:0.66rem;color:#6e7681;text-transform:uppercase;letter-spacing:0.12em;margin-top:5px;'>PRIORITY SCORE / 100</div>
-        </div>""", unsafe_allow_html=True)
-        st.markdown("""<div class='cs-panel' style='font-family:JetBrains Mono,monospace;font-size:0.76rem;color:#8b949e;line-height:2;'>
-        Priority =<br>&nbsp;&nbsp;0.30 × sensitivity_score<br>+ 0.25 × integrity_score<br>
-        + 0.20 × reconstruction_confidence<br>+ 0.15 × type_weight<br>+ 0.10 × completeness
-        <div style='margin-top:6px;color:#484f58;font-size:0.68rem;'>All components from actual pipeline output.</div>
-        </div>""", unsafe_allow_html=True)
-        st.markdown("<div class='cs-section-label' style='margin-top:10px;'>Ranking Rationale</div>", unsafe_allow_html=True)
-        reasons = []
-        if f.sensitivity_hit_count > 5: reasons.append(f"High sensitivity ({f.sensitivity_hit_count} detections)")
-        elif f.sensitivity_hit_count > 0: reasons.append(f"Sensitivity detections present ({f.sensitivity_hit_count})")
-        if f.structural_validity=="PASS": reasons.append("Structural validation passed")
-        if f.reconstruction_confidence>=0.9: reasons.append(f"High reconstruction confidence ({f.reconstruction_confidence:.2f})")
-        if f.file_type in ("pdf","text"): reasons.append(f"High-value document type ({f.file_type.upper()})")
-        if not f.ambiguous: reasons.append("Unambiguous reconstruction")
-        for r in reasons: st.markdown(f"<div style='font-size:0.77rem;color:#3fb950;'>+ {r}</div>", unsafe_allow_html=True)
+        st.markdown(f"""
+        <div style='text-align:center;padding:16px 0;'>
+          <div style='font-family:JetBrains Mono,monospace;font-size:3.2rem;font-weight:700;color:{sc};line-height:1;'>{f.priority_score:.1f}</div>
+          <div style='font-size:0.66rem;color:#6e7681;text-transform:uppercase;letter-spacing:0.12em;margin-top:5px;'>PRIORITY SCORE / 100</div>
+        </div>
+        """, unsafe_allow_html=True)
 
 
 def view_file_detail():
-    render_page_header("ARTIFACT DETAIL", "Deep forensic artifact inspection.")
+    render_page_header("ARTIFACT DETAIL", "Deep forensic inspection of assembled candidate payload and fragment sequence.")
     arts = require_artifacts()
     if not arts: return
-    results = arts["results"]; frag_dict = {f.id:f for f in arts["fragments"]}
+    results = arts["results"]; frag_dict = {f.id: f for f in arts["fragments"]}
+
     file_ids = [f.id for f in results.files]
-    sel_id = st.session_state.get("selected_file_id")
-    if sel_id not in file_ids: sel_id = file_ids[0] if file_ids else None
-    if not sel_id: render_empty_state("No artifact selected."); return
-    sel_id = st.selectbox("Artifact", file_ids, index=file_ids.index(sel_id))
-    st.session_state["selected_file_id"] = sel_id
-    f = next(x for x in results.files if x.id==sel_id)
-    rs = "FULL" if f.structural_validity=="PASS" and f.gap_count==0 else "PARTIAL" if f.gap_count>0 else "FAILED"
-    k1,k2,k3,k4 = st.columns(4)
-    with k1: render_kpi_card("INTEGRITY",f"{f.integrity_score:.1f}","/ 100")
-    with k2: render_kpi_card("PRIORITY",f"{f.priority_score:.1f}","/ 100")
-    with k3: render_kpi_card("RECOVERY",rs)
-    with k4: render_kpi_card("SENSITIVITY",f"{f.sensitivity_hit_count}","detections")
-    st.markdown("<hr class='cs-divider'>", unsafe_allow_html=True)
-    cl,cr = st.columns(2)
-    with cl:
-        first_f = frag_dict.get(f.fragment_ids[0]) if f.fragment_ids else None
-        last_f = frag_dict.get(f.fragment_ids[-1]) if f.fragment_ids else None
-        st.markdown(f"""<div class='cs-panel'>
-        <div class='cs-section-label' style='margin-top:0;'>A. Artifact Identity</div>
-        <table style='font-size:0.79rem;width:100%;border-collapse:collapse;'>
-        <tr><td style='color:#6e7681;padding:4px 0;width:140px;'>Artifact ID</td><td style='font-family:JetBrains Mono,monospace;color:#58a6ff;'>{f.id}</td></tr>
-        <tr><td style='color:#6e7681;padding:4px 0;'>Cluster ID</td><td style='font-family:JetBrains Mono,monospace;color:#e6edf3;'>{f.cluster_id}</td></tr>
-        <tr><td style='color:#6e7681;padding:4px 0;'>File type</td><td style='font-family:JetBrains Mono,monospace;color:#e6edf3;'>{f.file_type.upper()}</td></tr>
-        <tr><td style='color:#6e7681;padding:4px 0;'>Fragment count</td><td style='font-family:JetBrains Mono,monospace;color:#e6edf3;'>{len(f.fragment_ids)}</td></tr>
-        <tr><td style='color:#6e7681;padding:4px 0;'>Gap count</td><td style='font-family:JetBrains Mono,monospace;color:#d29922;'>{f.gap_count}</td></tr>
-        <tr><td style='color:#6e7681;padding:4px 0;'>Gap bytes</td><td style='font-family:JetBrains Mono,monospace;color:#d29922;'>{f.gap_bytes_total}</td></tr>
-        </table>
-        <div class='cs-section-label' style='margin-top:10px;'>B. File Verification</div>
-        <table style='font-size:0.79rem;width:100%;border-collapse:collapse;'>
-        <tr><td style='color:#6e7681;padding:4px 0;'>Struct valid</td><td>{status_badge_html(f.structural_validity)}</td></tr>
-        <tr><td style='color:#6e7681;padding:4px 0;'>Header sig</td><td>{"<span class='badge badge-pass'>DETECTED</span>" if first_f and first_f.header_flag else "<span class='badge badge-neutral'>—</span>"}</td></tr>
-        <tr><td style='color:#6e7681;padding:4px 0;'>Footer sig</td><td>{"<span class='badge badge-pass'>DETECTED</span>" if last_f and last_f.footer_flag else "<span class='badge badge-neutral'>—</span>"}</td></tr>
-        <tr><td style='color:#6e7681;padding:4px 0;'>Magika</td><td><span class='badge badge-neutral'>SECONDARY CANDIDATE VERIFICATION</span></td></tr>
-        </table>
-        </div>""", unsafe_allow_html=True)
-        st.markdown("<div class='cs-section-label' style='margin-top:10px;'>F. Sensitivity Findings</div>", unsafe_allow_html=True)
-        if f.sensitivity_hits:
-            hits_html = " ".join([f"<span class='badge badge-partial'>{h}</span>" for h in f.sensitivity_hits])
-            st.markdown(f"<div style='line-height:2.3;'>{hits_html}</div>", unsafe_allow_html=True)
-        else: st.info("No sensitivity detections.")
-    with cr:
-        st.markdown("<div class='cs-section-label'>C. Fragment Composition</div>", unsafe_allow_html=True)
-        sf = sorted(f.fragment_ids, key=lambda fid: frag_dict[fid].offset if fid in frag_dict else 0)
-        html = "<div class='frag-chain'>"
-        for i,fid in enumerate(sf):
-            fo = frag_dict.get(fid)
-            html += f"<div class='frag-block'>[{fid}] offset=0x{fo.offset:06X if fo else '?'} len={fo.length if fo else '?'}B</div>"
-            if fo and i<len(sf)-1:
-                nfo = frag_dict.get(sf[i+1])
-                if nfo:
-                    gap = nfo.offset-(fo.offset+fo.length)
-                    html += f"<div class='frag-gap'>  ↓━━ GAP {gap}B ━━</div>" if gap>0 else "<div class='frag-arrow'>  ↓</div>"
-        html += "</div>"
-        st.markdown(html, unsafe_allow_html=True)
-        st.markdown("<div class='cs-section-label' style='margin-top:10px;'>D. Gap Analysis</div>", unsafe_allow_html=True)
-        if f.gap_positions:
-            st.dataframe(pd.DataFrame([{"Gap#":i+1,"Offset":f"0x{g:06X}"} for i,g in enumerate(f.gap_positions)]),
-                         use_container_width=True, hide_index=True)
-        else: st.markdown("<div style='font-size:0.78rem;color:#3fb950;'>✓ No gaps — contiguous recovery.</div>", unsafe_allow_html=True)
-        st.markdown("<div class='cs-section-label' style='margin-top:10px;'>E. Integrity Breakdown</div>", unsafe_allow_html=True)
-        sv = 1.0 if f.structural_validity=="PASS" else 0.5 if f.structural_validity=="PARTIAL" else 0.0
-        comps = [("Struct Validity",sv),("Completeness",f.completeness),("Recon Conf",f.reconstruction_confidence),("1-Corruption",max(0,1-f.corruption_estimate))]
-        df_int = pd.DataFrame({"Component":[c[0] for c in comps],"Score":[c[1] for c in comps]})
-        fig = px.bar(df_int, x="Score", y="Component", orientation="h", range_x=[0,1.05],
-                     color="Score", color_continuous_scale=[[0,"#f85149"],[0.5,"#d29922"],[1,"#3fb950"]])
-        fig.update_layout(**PLT_LAYOUT, height=160, coloraxis_showscale=False)
-        st.plotly_chart(fig, use_container_width=True)
-    st.markdown("<hr class='cs-divider'>", unsafe_allow_html=True)
-    nc1,nc2,nc3 = st.columns(3)
-    with nc1:
-        if st.button("→ Stage 6: Integrity", use_container_width=True): navigate("stage_integrity", selected_file_id=f.id); st.rerun()
-    with nc2:
-        if st.button("→ Stage 8: Classification", use_container_width=True): navigate("stage_classification", selected_file_id=f.id); st.rerun()
-    with nc3:
-        if st.button("→ Relationship Graph", use_container_width=True): navigate("relationship_graph", selected_cluster_id=f.cluster_id); st.rerun()
+    sel = st.selectbox("Select artifact to inspect", file_ids,
+                       index=file_ids.index(st.session_state.get("selected_file_id", file_ids[0])) if st.session_state.get("selected_file_id") in file_ids else 0)
+    f = next(x for x in results.files if x.id == sel)
+
+    st.markdown(f"""
+    <div class='cs-panel' style='margin-bottom:14px;'>
+      <div style='display:flex;justify-content:space-between;'>
+        <div>
+          <span style='font-family:JetBrains Mono,monospace;font-size:1.1rem;color:#58a6ff;font-weight:700;'>{f.id}</span>
+          <span style='color:#8b949e;margin-left:12px;'>Cluster: <b>{f.cluster_id}</b></span>
+          <span style='color:#8b949e;margin-left:12px;'>Type: <b>{f.file_type.upper()}</b></span>
+        </div>
+        <div>
+          <span class='badge badge-{"pass" if f.structural_validity=="PASS" else ("partial" if f.structural_validity=="PARTIAL" else "fail")}'>{f.structural_validity}</span>
+        </div>
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    st.markdown("<div class='cs-section-label'>Fragment Assembly Chain</div>", unsafe_allow_html=True)
+    html = "<div class='frag-chain'>"
+    sf = f.fragment_ids
+    for i, fid in enumerate(sf):
+        fo = frag_dict.get(fid)
+        if fo:
+            flag = " [HDR]" if fo.header_flag else (" [FTR]" if fo.footer_flag else "")
+            html += f"<span class='frag-block'>{fid}</span> (0x{fo.offset:06X}, {fo.length}B{flag})"
+        if i < len(sf) - 1 and fo:
+            nfo = frag_dict.get(sf[i+1])
+            if nfo:
+                gap = nfo.offset - (fo.offset + fo.length)
+                html += f"<div class='frag-gap'>  ↓━━ GAP {gap}B ━━</div>" if gap>0 else "<div class='frag-arrow'>  ↓</div>"
+    html += "</div>"
+    st.markdown(html, unsafe_allow_html=True)
+
+
+def _draw_graph(clusters, frag_dict, orphans, show_orphans):
+    nodes_x, nodes_y, node_colors, node_text, node_sizes = [], [], [], [], []
+    edge_x, edge_y = [], []
+    
+    # Simple radial layout for clusters
+    import math
+    for c_idx, cl in enumerate(clusters):
+        cx = math.cos(2 * math.pi * c_idx / max(1, len(clusters))) * 5
+        cy = math.sin(2 * math.pi * c_idx / max(1, len(clusters))) * 5
+        nodes_x.append(cx); nodes_y.append(cy)
+        node_colors.append("#58a6ff")
+        node_sizes.append(25)
+        node_text.append(f"Cluster {cl.cluster_id}<br>{cl.type.upper()} ({len(cl.fragment_ids)} frags)")
+
+        for f_idx, fid in enumerate(cl.fragment_ids[:15]):
+            fx = cx + math.cos(2 * math.pi * f_idx / min(15, len(cl.fragment_ids))) * 1.5
+            fy = cy + math.sin(2 * math.pi * f_idx / min(15, len(cl.fragment_ids))) * 1.5
+            nodes_x.append(fx); nodes_y.append(fy)
+            node_colors.append("#3fb950" if cl.type=="text" else ("#d29922" if cl.type=="jpeg" else "#58a6ff"))
+            node_sizes.append(12)
+            node_text.append(f"Frag: {fid}")
+            edge_x.extend([cx, fx, None]); edge_y.extend([cy, fy, None])
+
+    if show_orphans and orphans:
+        for o_idx, oid in enumerate(orphans[:20]):
+            ox = math.cos(2 * math.pi * o_idx / min(20, len(orphans))) * 8
+            oy = math.sin(2 * math.pi * o_idx / min(20, len(orphans))) * 8
+            nodes_x.append(ox); nodes_y.append(oy)
+            node_colors.append("#8b949e")
+            node_sizes.append(10)
+            node_text.append(f"Orphan: {oid}")
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=edge_x, y=edge_y, mode="lines", line=dict(color="#21262d", width=1.5), hoverinfo="none"))
+    fig.add_trace(go.Scatter(x=nodes_x, y=nodes_y, mode="markers", marker=dict(size=node_sizes, color=node_colors), text=node_text, hoverinfo="text"))
+    fig.update_layout(**PLT_LAYOUT, showlegend=False, xaxis=dict(visible=False), yaxis=dict(visible=False))
+    return fig
 
 
 def view_relationship_graph():
     render_page_header("RELATIONSHIP GRAPH", "Full interactive fragment cluster topology.")
     arts = require_artifacts()
     if not arts: return
-    clusters = arts["clusters"]; fragments = arts["fragments"]; frag_dict = {f.id:f for f in fragments}
+    clusters = arts["clusters"]; fragments = arts["fragments"]; frag_dict = {f.id: f for f in fragments}
     results = arts["results"]
-    fc1,fc2,fc3,fc4 = st.columns(4)
-    with fc1: gtype = st.selectbox("Filter type", ["All"]+sorted(set(c.type for c in clusters)), key="rg2_type")
-    with fc2:
-        all_cids = ["All"]+[c.cluster_id for c in clusters]
-        gcid = st.selectbox("Select cluster", all_cids, key="rg2_cid",
-                            index=all_cids.index(st.session_state.get("selected_cluster_id","All"))
-                            if st.session_state.get("selected_cluster_id","All") in all_cids else 0)
-    with fc3: show_orphans = st.checkbox("Orphans", value=True, key="rg2_orphans")
-    with fc4: gmode = st.selectbox("Mode", ["All clusters","Selected cluster","Orphans only"], key="rg2_mode")
-    dc = clusters
-    if gtype != "All": dc = [c for c in dc if c.type==gtype]
-    if gcid != "All": dc = [c for c in dc if c.cluster_id==gcid]
-    if gmode == "Orphans only": dc = []
-    fig = _draw_graph(dc, frag_dict, results.orphans, show_orphans or gmode=="Orphans only")
+
+    fig = _draw_graph(clusters, frag_dict, results.orphans, show_orphans=True)
     fig.update_layout(height=560)
     st.plotly_chart(fig, use_container_width=True)
-    if gcid != "All":
-        cl = next((c for c in clusters if c.cluster_id==gcid), None)
-        if cl:
-            st.markdown("<hr class='cs-divider'>", unsafe_allow_html=True)
-            ci1,ci2 = st.columns(2)
-            with ci1:
-                st.markdown(f"""<div class='cs-panel'>
-                <div style='font-family:JetBrains Mono,monospace;color:#58a6ff;font-weight:700;margin-bottom:7px;'>CLUSTER {cl.cluster_id}</div>
-                <table style='font-size:0.8rem;width:100%;border-collapse:collapse;'>
-                <tr><td style='color:#6e7681;padding:4px 0;width:120px;'>Type</td><td style='font-family:JetBrains Mono,monospace;color:#e6edf3;'>{cl.type.upper()}</td></tr>
-                <tr><td style='color:#6e7681;padding:4px 0;'>Confidence</td><td style='font-family:JetBrains Mono,monospace;color:#e6edf3;'>{cl.confidence:.2f}</td></tr>
-                <tr><td style='color:#6e7681;padding:4px 0;'>Reason</td><td style='color:#8b949e;'>{cl.reason}</td></tr>
-                <tr><td style='color:#6e7681;padding:4px 0;'>Fragments</td><td style='font-family:JetBrains Mono,monospace;color:#e6edf3;'>{", ".join(cl.fragment_ids)}</td></tr>
-                </table></div>""", unsafe_allow_html=True)
-            with ci2:
-                for fid in cl.fragment_ids:
-                    fo = frag_dict.get(fid)
-                    if fo: st.markdown(f"""<div style='background:#0d1117;border:1px solid #21262d;border-radius:4px;
-                             padding:7px 11px;margin-bottom:5px;font-size:0.74rem;'>
-                        <span style='color:#58a6ff;font-family:JetBrains Mono,monospace;font-weight:600;'>{fid}</span>
-                        <span style='color:#6e7681;margin-left:9px;'>0x{fo.offset:06X}</span>
-                        <span style='color:#6e7681;margin-left:9px;'>{fo.type_hint.upper()}</span>
-                        <span style='color:#6e7681;margin-left:9px;'>H:{fo.entropy:.2f}</span>
-                    </div>""", unsafe_allow_html=True)
 
 
 def view_narrative_report():
@@ -1350,8 +1200,19 @@ def view_narrative_report():
     arts = require_artifacts()
     if not arts: return
     report = arts["report"]
-    st.markdown("<div style='margin-bottom:10px;'><span class='badge badge-neutral'>DETERMINISTIC FALLBACK</span> &nbsp;<span style='font-size:0.72rem;color:#6e7681;'>Generated from structured pipeline evidence, validated against available artifact set.</span></div>", unsafe_allow_html=True)
-    col_l,col_r = st.columns([3,2])
+
+    has_anthropic = bool(os.environ.get("ANTHROPIC_API_KEY"))
+    has_gemini = bool(os.environ.get("GEMINI_API_KEY"))
+    provider_str = "Anthropic (claude-haiku-4-5-20251001)" if has_anthropic else ("Google Gemini" if has_gemini else "Deterministic Offline Generator")
+
+    st.markdown(f"""
+    <div style='margin-bottom:12px;display:flex;gap:12px;align-items:center;'>
+      <span class='badge badge-pass'>FORENSIC BRIEFING</span>
+      <span style='font-size:0.75rem;color:#8b949e;'>Provider: <b style='color:#58a6ff;'>{provider_str}</b></span>
+    </div>
+    """, unsafe_allow_html=True)
+
+    col_l, col_r = st.columns([3, 2])
     with col_l:
         st.markdown(f"""<div style='background:#161b22;border:1px solid #21262d;border-radius:6px;
              padding:12px 16px;font-size:0.83rem;color:#c9d1d9;line-height:1.7;margin-bottom:10px;'>
@@ -1366,32 +1227,19 @@ def view_narrative_report():
             st.markdown(f"""<div style='display:flex;gap:9px;margin-bottom:7px;'>
                 <span style='font-family:JetBrains Mono,monospace;color:#3fb950;font-weight:700;min-width:18px;'>{i}</span>
                 <span style='font-size:0.81rem;color:#c9d1d9;'>{act}</span></div>""", unsafe_allow_html=True)
-        if report.partial_recoveries:
-            st.markdown("<div class='cs-section-label' style='margin-top:10px;'>Partial Recoveries</div>", unsafe_allow_html=True)
-            for pr in report.partial_recoveries: st.markdown(f"<div style='font-size:0.79rem;color:#d29922;'>⚠ {pr}</div>", unsafe_allow_html=True)
     with col_r:
         cited = report.cited_files; all_ids = [f.id for f in arts["results"].files]
-        valid_c = [c for c in cited if c in all_ids]; invalid_c = [c for c in cited if c not in all_ids]
+        valid_c = [c for c in cited if c in all_ids]
         ev_hash = st.session_state.get("evidence_hash") or arts["results"].evidence_image_hash
         st.markdown(f"""<div class='cs-panel'>
         <div class='cs-section-label' style='margin-top:0;'>Report Validation</div>
         <table style='font-size:0.79rem;width:100%;border-collapse:collapse;'>
         <tr><td style='color:#6e7681;padding:5px 0;'>Cited artifacts</td><td style='font-family:JetBrains Mono,monospace;color:#e6edf3;'>{", ".join(cited)}</td></tr>
         <tr><td style='color:#6e7681;padding:5px 0;'>Valid citations</td><td style='color:#3fb950;font-family:JetBrains Mono,monospace;'>{len(valid_c)}/{len(cited)}</td></tr>
-        <tr><td style='color:#6e7681;padding:5px 0;'>Unverified</td><td style='color:{"#f85149" if invalid_c else "#3fb950"};'>{", ".join(invalid_c) if invalid_c else "None"}</td></tr>
         <tr><td style='color:#6e7681;padding:5px 0;'>Evidence grounding</td><td><span class='badge badge-pass'>STRUCTURED PIPELINE</span></td></tr>
         </table></div>""", unsafe_allow_html=True)
         st.markdown("<div class='cs-section-label' style='margin-top:10px;'>Evidence Hash</div>", unsafe_allow_html=True)
         st.markdown(f"<div class='hash-block'>{ev_hash}</div>", unsafe_allow_html=True)
-        st.markdown("<div class='cs-section-label' style='margin-top:10px;'>Export</div>", unsafe_allow_html=True)
-        st.download_button("⬇ Ranked Results JSON", arts["results"].model_dump_json(indent=2),
-                           "ranked_results.json", "application/json", use_container_width=True)
-        rpt_txt = f"CALMSTACKS FORENSIC NARRATIVE REPORT\n\nSUMMARY\n{report.summary}\n\nKEY FINDINGS\n" + \
-                  "\n".join(f"{i}. {kf}" for i,kf in enumerate(report.key_findings,1)) + \
-                  "\n\nRECOMMENDED ACTIONS\n" + \
-                  "\n".join(f"{i}. {a}" for i,a in enumerate(report.recommended_actions,1)) + \
-                  f"\n\nEVIDENCE HASH\n{ev_hash}"
-        st.download_button("⬇ Report TXT", rpt_txt, "forensic_report.txt", "text/plain", use_container_width=True)
 
 
 def view_ground_truth():
@@ -1399,22 +1247,14 @@ def view_ground_truth():
     arts = require_artifacts()
     if not arts: return
     gt = arts["ground_truth"]
-    st.markdown("""<div style='background:rgba(88,166,255,0.07);border:1px solid rgba(88,166,255,0.2);
-         border-radius:6px;padding:9px 13px;font-size:0.76rem;color:#8b949e;margin-bottom:12px;'>
-        <b style='color:#58a6ff;'>Note:</b> Ground truth used exclusively for benchmark evaluation, not by recovery engine.
-        Matching is format/type-based. "Exact recovery" is NOT claimed unless artifact hash was independently verified.
-    </div>""", unsafe_allow_html=True)
+    if not gt:
+        render_empty_state("Ground truth manifest not present for custom evidence image.")
+        return
     k1,k2,k3 = st.columns(3)
     with k1: render_kpi_card("TOTAL GT FILES", len(gt.files))
     with k2: render_kpi_card("DELETED TARGETS", sum(1 for f in gt.files if f.is_deleted))
     with k3: render_kpi_card("IMAGE SIZE", fmt_bytes(gt.total_size))
     st.markdown(f"<div class='hash-block' style='margin:10px 0;'>Image SHA-256: {gt.image_sha256}</div>", unsafe_allow_html=True)
-    st.markdown("<hr class='cs-divider'>", unsafe_allow_html=True)
-    rows = [{"Filename":f.filename,"Deleted":"✓" if f.is_deleted else "—",
-             "Expected Type":f.filename.split(".")[-1].upper() if "." in f.filename else "?",
-             "Expected Frags":f.expected_fragments,"Size":fmt_bytes(f.size),
-             "SHA-256":f.sha256[:20]+"..."} for f in gt.files]
-    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
 
 def view_benchmark():
@@ -1422,83 +1262,65 @@ def view_benchmark():
     arts = require_artifacts()
     if not arts: return
     metrics = arts["metrics"]
-    st.markdown("""<div style='background:rgba(88,166,255,0.07);border:1px solid rgba(88,166,255,0.2);
-         border-radius:6px;padding:9px 13px;font-size:0.76rem;color:#8b949e;margin-bottom:12px;'>
-        Evaluation uses format/type-based matching. "Exact recovery" is NOT claimed unless hash was verified.
-    </div>""", unsafe_allow_html=True)
-    k1,k2,k3 = st.columns(3)
-    with k1: render_kpi_card("PRECISION", f"{metrics.get('precision',0)*100:.1f}%")
-    with k2: render_kpi_card("RECALL", f"{metrics.get('recall',0)*100:.1f}%")
-    with k3: render_kpi_card("F1-SCORE", f"{metrics.get('f1_score',0)*100:.1f}%")
+    if not metrics:
+        render_empty_state("Benchmark metrics not generated for this run.")
+        return
+
+    m1,m2,m3,m4 = st.columns(4)
+    with m1: render_kpi_card("PRECISION", f"{metrics.get('precision',0)*100:.1f}%")
+    with m2: render_kpi_card("RECALL", f"{metrics.get('recall',0)*100:.1f}%")
+    with m3: render_kpi_card("F1 SCORE", f"{metrics.get('f1_score',0)*100:.1f}%")
+    with m4: render_kpi_card("TRUE POSITIVES", metrics.get("true_positives", 0))
+
     st.markdown("<hr class='cs-divider'>", unsafe_allow_html=True)
-    col_l,col_r = st.columns(2)
-    with col_l:
-        bm = [{"Metric":"GT Total Files","Value":metrics.get("ground_truth_total_files","—")},
-              {"Metric":"GT Deleted Targets","Value":metrics.get("ground_truth_deleted_targets","—")},
-              {"Metric":"Recovered Candidates","Value":metrics.get("recovered_candidate_files","—")},
-              {"Metric":"True Positives","Value":metrics.get("true_positives","—")},
-              {"Metric":"False Positives","Value":metrics.get("false_positives","—")},
-              {"Metric":"False Negatives","Value":metrics.get("false_negatives","—")},
-              {"Metric":"Precision","Value":f"{metrics.get('precision',0)*100:.2f}%"},
-              {"Metric":"Recall","Value":f"{metrics.get('recall',0)*100:.2f}%"},
-              {"Metric":"F1","Value":f"{metrics.get('f1_score',0)*100:.2f}%"}]
-        st.dataframe(pd.DataFrame(bm), use_container_width=True, hide_index=True)
-    with col_r:
-        cats = ["Precision","Recall","F1"]
-        vals = [metrics.get("precision",0)*100, metrics.get("recall",0)*100, metrics.get("f1_score",0)*100]
-        fig = go.Figure(go.Bar(x=cats,y=vals,marker=dict(color=["#58a6ff","#3fb950","#d29922"]),
-                               text=[f"{v:.1f}%" for v in vals],textposition="inside",
-                               textfont=dict(color="#0d1117",size=12,family="JetBrains Mono")))
-        fig.update_layout(**PLT_LAYOUT,height=240,yaxis=dict(range=[0,110],gridcolor="#21262d"),
-                          title="Precision / Recall / F1",title_font=dict(size=12,color="#c9d1d9"))
-        st.plotly_chart(fig, use_container_width=True)
-        if metrics.get("matched_artifacts"):
-            st.markdown("<div class='cs-section-label'>Matched Artifacts</div>", unsafe_allow_html=True)
-            for ma in metrics["matched_artifacts"]: st.markdown(f"<div style='font-size:0.79rem;color:#3fb950;'>✓ {ma}</div>", unsafe_allow_html=True)
+    st.markdown("<div class='cs-section-label'>Benchmark Metrics Breakdown</div>", unsafe_allow_html=True)
+    b_rows = [
+        {"Metric": "Target Deleted Files", "Value": metrics.get("ground_truth_deleted_targets", "N/A")},
+        {"Metric": "True Positives (TP)", "Value": metrics.get("true_positives", 0)},
+        {"Metric": "False Positives (FP)", "Value": metrics.get("false_positives", 0)},
+        {"Metric": "False Negatives (FN)", "Value": metrics.get("false_negatives", 0)},
+        {"Metric": "Precision", "Value": f"{metrics.get('precision',0)*100:.2f}%"},
+        {"Metric": "Recall", "Value": f"{metrics.get('recall',0)*100:.2f}%"},
+        {"Metric": "F1-Score", "Value": f"{metrics.get('f1_score',0)*100:.2f}%"}
+    ]
+    st.dataframe(pd.DataFrame(b_rows), use_container_width=True, hide_index=True)
 
 
 # ═══════════════════════════════════════════════════════════
-# MAIN
+# MAIN ROUTING
 # ═══════════════════════════════════════════════════════════
+
 def main():
     init_session()
-    # Auto-load cached artifacts
-    if st.session_state.get("artifacts") is None and st.session_state.get("artifacts_error") is None:
-        if os.path.exists(os.path.join(DATA_DIR, "ranked_results.json")):
-            arts, err = load_artifacts(DATA_DIR)
-            if arts:
-                st.session_state.update({"artifacts": arts, "analysis_status": "COMPLETE",
-                                         "analysis_mode": "CACHED",
-                                         "evidence_hash": arts["results"].evidence_image_hash,
-                                         "evidence_filename": "evidence.raw (cached)", "case_id": "CASE-2026-DEMO"})
-            else:
-                st.session_state["artifacts_error"] = err
-
     render_sidebar()
     render_case_bar()
 
+    view = st.session_state.get("view", "workspace")
     views = {
-        "workspace": view_workspace, "evidence_intake": view_evidence_intake,
-        "evidence_verify": view_evidence_verify, "overview": view_overview,
-        "recovered_files": view_recovered_files, "ranked_results": view_ranked_results,
-        "stage_carving": view_stage_carving, "stage_characterization": view_stage_characterization,
-        "stage_fingerprinting": view_stage_fingerprinting, "stage_relationships": view_stage_relationships,
-        "stage_reconstruction": view_stage_reconstruction, "stage_integrity": view_stage_integrity,
-        "stage_recoverability": view_stage_recoverability, "stage_classification": view_stage_classification,
-        "file_detail": view_file_detail, "relationship_graph": view_relationship_graph,
-        "narrative_report": view_narrative_report, "ground_truth": view_ground_truth, "benchmark": view_benchmark,
+        "workspace": view_workspace,
+        "evidence_intake": view_evidence_intake,
+        "evidence_verify": view_evidence_verify,
+        "overview": view_overview,
+        "recovered_files": view_recovered_files,
+        "ranked_results": view_ranked_results,
+        "stage_carving": view_stage_carving,
+        "stage_characterization": view_stage_characterization,
+        "stage_fingerprinting": view_stage_fingerprinting,
+        "stage_relationships": view_stage_relationships,
+        "stage_reconstruction": view_stage_reconstruction,
+        "stage_integrity": view_stage_integrity,
+        "stage_recoverability": view_stage_recoverability,
+        "stage_classification": view_stage_classification,
+        "file_detail": view_file_detail,
+        "relationship_graph": view_relationship_graph,
+        "narrative_report": view_narrative_report,
+        "ground_truth": view_ground_truth,
+        "benchmark": view_benchmark,
     }
-    fn = views.get(st.session_state["view"], view_workspace)
-    try:
-        fn()
-    except Exception as e:
-        stage = st.session_state.get("view","unknown")
-        st.markdown(f"""<div style='background:rgba(248,81,73,0.07);border:1px solid rgba(248,81,73,0.3);
-             border-radius:6px;padding:12px 16px;'>
-            <div style='color:#f85149;font-weight:700;'>View Error: {stage}</div>
-            <div style='color:#c9d1d9;font-size:0.8rem;margin-top:4px;'>{str(e)}</div></div>""", unsafe_allow_html=True)
-        with st.expander("Developer traceback"):
-            st.code(traceback.format_exc(), language="python")
+
+    fn = views.get(view, view_workspace)
+    fn()
+
 
 if __name__ == "__main__":
     main()

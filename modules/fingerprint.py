@@ -183,6 +183,7 @@ def generate_feature_vectors(
     """
     t_stage_start = time.perf_counter()
     print("[START] Stage 2 — Fingerprinting", flush=True)
+    print(f"[*] Semantic embeddings: {'ENABLED (experimental)' if USE_SEMANTIC_EMBEDDINGS else 'DISABLED (default)'}", flush=True)
 
     if not os.path.exists(fragments_path):
         raise FileNotFoundError(f"Fragments file not found: {fragments_path}")
